@@ -66,10 +66,8 @@ impl SessionManager {
     pub async fn create_session(&self, cols: u16, rows: u16) -> Result<Arc<RwLock<Session>>, SessionError> {
         let id = Uuid::new_v4().to_string();
 
-        // Create Docker container
         let container_id = self.container_manager.create_container(&id).await?;
 
-        // Spawn PTY connected to container
         let (pty_cmd_tx, pty_output_rx) = spawn_docker_pty(container_id.clone(), cols, rows)?;
 
         let session = Session {
@@ -102,7 +100,6 @@ impl SessionManager {
         let session_guard = session.read().await;
         session_guard.shutdown().await;
 
-        // Remove the container
         if let Err(e) = self.container_manager.remove_container(&session_guard.container_id).await {
             error!(session_id = %id, error = %e, "Failed to remove container");
         }
