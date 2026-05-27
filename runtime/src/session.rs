@@ -214,4 +214,15 @@ impl SessionManager {
     pub async fn list_sessions(&self) -> Vec<String> {
         self.sessions.read().await.keys().cloned().collect()
     }
+
+    pub async fn export_workspace(&self, session_id: &str) -> Result<Vec<u8>, SessionError> {
+        let session = self.sessions.read().await
+            .get(session_id)
+            .cloned()
+            .ok_or(SessionError::NotFound)?;
+
+        let container_id = session.read().await.container_id.clone();
+        let data = self.container_manager.export_workspace(&container_id).await?;
+        Ok(data)
+    }
 }

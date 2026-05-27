@@ -1,7 +1,8 @@
 //! Capsule Runtime - Docker container management
 
-use bollard::container::{Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions};
+use bollard::container::{Config, CreateContainerOptions, DownloadFromContainerOptions, RemoveContainerOptions, StartContainerOptions};
 use bollard::Docker;
+use futures_util::StreamExt;
 use thiserror::Error;
 use tracing::info;
 
@@ -85,5 +86,23 @@ impl ContainerManager {
     /// Get the Docker client for exec operations
     pub fn docker(&self) -> &Docker {
         &self.docker
+    }
+
+    /// Download workspace directory as tar archive
+    pub async fn export_workspace(&self, container_id: &str) -> Result<Vec<u8>, DockerError> {
+        let options = DownloadFromContainerOptions {
+            path: "/workspace",
+        };
+
+        let mut stream = self.docker.download_from_container(container_id, Some(options));
+        let mut data = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            data.extend_from_slice(&chunk);
+        }
+
+        info!(container_id = %container_id, size = data.len(), "Exported workspace");
+        Ok(data)
     }
 }

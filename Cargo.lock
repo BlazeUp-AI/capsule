@@ -193,6 +193,7 @@ dependencies = [
  "bollard",
  "bytes",
  "futures",
+ "futures-util",
  "portable-pty",
  "serde",
  "serde_json",
