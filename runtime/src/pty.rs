@@ -1,7 +1,7 @@
 //! Capsule Runtime - PTY management
 //!
 //! Handles PTY creation, I/O, and lifecycle using portable-pty.
-//! All PTY operations run in a dedicated thread to avoid Send/Sync issues.
+//! Supports both local shell and Docker container exec.
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
@@ -13,15 +13,12 @@ use tracing::{error, info, warn};
 pub enum PtyError {
     #[error("Failed to open PTY: {0}")]
     OpenFailed(String),
-    #[error("Failed to spawn shell: {0}")]
+    #[error("Failed to spawn process: {0}")]
     SpawnFailed(String),
     #[error("PTY I/O error: {0}")]
     IoError(#[from] std::io::Error),
-    #[error("PTY not found")]
-    NotFound,
 }
 
-/// Commands that can be sent to a running PTY
 #[derive(Debug)]
 pub enum PtyCommand {
     Write(Vec<u8>),
@@ -29,18 +26,16 @@ pub enum PtyCommand {
     Shutdown,
 }
 
-/// Spawn a PTY and return channels for communication.
-/// All PTY operations happen in a dedicated OS thread.
-pub fn spawn_pty(
+/// Spawn a PTY with a local bash shell (for testing)
+pub fn spawn_local_pty(
     cols: u16,
     rows: u16,
 ) -> Result<(mpsc::Sender<PtyCommand>, mpsc::Receiver<Vec<u8>>), PtyError> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<PtyCommand>(64);
     let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>(256);
 
-    // Spawn a dedicated thread for all PTY operations
     std::thread::spawn(move || {
-        if let Err(e) = run_pty_thread(cols, rows, cmd_rx, output_tx) {
+        if let Err(e) = run_local_pty_thread(cols, rows, cmd_rx, output_tx) {
             error!("PTY thread error: {}", e);
         }
     });
@@ -48,10 +43,69 @@ pub fn spawn_pty(
     Ok((cmd_tx, output_rx))
 }
 
-/// Main PTY thread function - handles all PTY I/O in a single thread
+/// Spawn a PTY that executes into a Docker container
+pub fn spawn_docker_pty(
+    container_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(mpsc::Sender<PtyCommand>, mpsc::Receiver<Vec<u8>>), PtyError> {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<PtyCommand>(64);
+    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>(256);
+
+    std::thread::spawn(move || {
+        if let Err(e) = run_docker_pty_thread(&container_id, cols, rows, cmd_rx, output_tx) {
+            error!("Docker PTY thread error: {}", e);
+        }
+    });
+
+    Ok((cmd_tx, output_rx))
+}
+
+// ── Local PTY ──────────────────────────────────────────────────────────────────
+
+fn run_local_pty_thread(
+    cols: u16,
+    rows: u16,
+    cmd_rx: mpsc::Receiver<PtyCommand>,
+    output_tx: mpsc::Sender<Vec<u8>>,
+) -> Result<(), PtyError> {
+    let mut cmd = CommandBuilder::new("/bin/bash");
+    cmd.args(["--norc", "--noprofile"]);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("PS1", "$ ");
+
+    run_pty_thread(cols, rows, cmd, cmd_rx, output_tx)
+}
+
+// ── Docker PTY ─────────────────────────────────────────────────────────────────
+
+fn run_docker_pty_thread(
+    container_id: &str,
+    cols: u16,
+    rows: u16,
+    cmd_rx: mpsc::Receiver<PtyCommand>,
+    output_tx: mpsc::Sender<Vec<u8>>,
+) -> Result<(), PtyError> {
+    let mut cmd = CommandBuilder::new("docker");
+    cmd.args([
+        "exec",
+        "-it",
+        "-e", "TERM=xterm-256color",
+        "-e", "LANG=C.UTF-8",
+        "-w", "/workspace",
+        container_id,
+        "/bin/bash",
+    ]);
+
+    run_pty_thread(cols, rows, cmd, cmd_rx, output_tx)
+}
+
+// ── Common PTY thread ──────────────────────────────────────────────────────────
+
 fn run_pty_thread(
     cols: u16,
     rows: u16,
+    cmd: CommandBuilder,
     mut cmd_rx: mpsc::Receiver<PtyCommand>,
     output_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), PtyError> {
@@ -66,18 +120,11 @@ fn run_pty_thread(
         })
         .map_err(|e| PtyError::OpenFailed(e.to_string()))?;
 
-    // Use bash with minimal config for debugging
-    let mut cmd = CommandBuilder::new("/bin/bash");
-    cmd.args(["--norc", "--noprofile"]);
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("PS1", "$ ");
-
     let mut child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| PtyError::SpawnFailed(e.to_string()))?;
 
-    // Drop slave - we only need the master now
     drop(pair.slave);
 
     let mut writer = pair
@@ -92,14 +139,11 @@ fn run_pty_thread(
 
     let master = pair.master;
 
-    info!(cols, rows, "PTY spawned with bash");
+    info!(cols, rows, "PTY spawned");
 
-    // Spawn a thread to read from PTY and send to output channel
     let reader_handle = std::thread::spawn(move || run_reader_thread(reader, output_tx));
 
-    // Main loop: handle commands
     loop {
-        // Use blocking_recv since we're in a dedicated thread
         match cmd_rx.blocking_recv() {
             Some(PtyCommand::Write(data)) => {
                 if !write_to_pty(&mut writer, &data) {
@@ -128,24 +172,19 @@ fn run_pty_thread(
         }
     }
 
-    // Clean up
     drop(writer);
     drop(master);
-
-    // Wait for reader thread
     let _ = reader_handle.join();
 
-    // Wait for child process
     match child.wait() {
-        Ok(status) => info!("Shell exited with status: {:?}", status),
-        Err(e) => warn!("Failed to wait for shell: {}", e),
+        Ok(status) => info!("Process exited with status: {:?}", status),
+        Err(e) => warn!("Failed to wait for process: {}", e),
     }
 
     info!("PTY thread exiting");
     Ok(())
 }
 
-/// Write data to PTY and flush. Returns false on error.
 fn write_to_pty(writer: &mut dyn Write, data: &[u8]) -> bool {
     if let Err(e) = writer.write_all(data) {
         error!("PTY write error: {}", e);
@@ -158,7 +197,6 @@ fn write_to_pty(writer: &mut dyn Write, data: &[u8]) -> bool {
     true
 }
 
-/// PTY reader thread — reads output from the PTY and forwards it to the output channel.
 fn run_reader_thread(mut reader: Box<dyn Read + Send>, output_tx: mpsc::Sender<Vec<u8>>) {
     let mut buf = [0u8; 4096];
     loop {
@@ -171,7 +209,6 @@ fn run_reader_thread(mut reader: Box<dyn Read + Send>, output_tx: mpsc::Sender<V
     }
 }
 
-/// Read one chunk from the PTY. Returns None on EOF or error.
 fn read_pty_chunk(reader: &mut Box<dyn Read + Send>, buf: &mut [u8]) -> Option<usize> {
     match reader.read(buf) {
         Ok(0) => {

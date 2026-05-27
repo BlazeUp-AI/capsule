@@ -1,11 +1,6 @@
 //! Capsule Runtime Server
-//!
-//! Main entry point for the Capsule runtime daemon.
 
-use axum::{
-    routing::get,
-    Router,
-};
+use axum::{routing::get, Router};
 use capsule_runtime::{session::SessionManager, websocket::ws_handler};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -24,7 +19,14 @@ async fn main() {
 
     info!("Starting Capsule Runtime");
 
-    let sessions = Arc::new(SessionManager::new());
+    let sessions = match SessionManager::new() {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::error!("Failed to initialize session manager: {}", e);
+            tracing::error!("Is Docker running?");
+            std::process::exit(1);
+        }
+    };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)

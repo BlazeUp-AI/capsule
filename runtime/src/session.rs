@@ -1,15 +1,13 @@
 //! Capsule Runtime - Session management
-//!
-//! Handles session lifecycle and state.
 
-use crate::pty::{spawn_pty, PtyCommand, PtyError};
+use crate::docker::{ContainerManager, DockerError};
+use crate::pty::{spawn_docker_pty, PtyCommand, PtyError};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
-/// Session state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
     Active,
@@ -17,92 +15,101 @@ pub enum SessionState {
     Terminated,
 }
 
-/// A runtime session with PTY
 pub struct Session {
     pub id: String,
     pub state: SessionState,
+    pub container_id: String,
     pub pty_cmd_tx: mpsc::Sender<PtyCommand>,
     pub pty_output_rx: Option<mpsc::Receiver<Vec<u8>>>,
 }
 
 impl Session {
-    /// Create a new session with a PTY
-    pub fn new(cols: u16, rows: u16) -> Result<Self, PtyError> {
-        let id = Uuid::new_v4().to_string();
-        let (pty_cmd_tx, pty_output_rx) = spawn_pty(cols, rows)?;
-
-        info!(session_id = %id, "Session created");
-
-        Ok(Self {
-            id,
-            state: SessionState::Active,
-            pty_cmd_tx,
-            pty_output_rx: Some(pty_output_rx),
-        })
-    }
-
-    /// Take the output receiver (can only be done once)
     pub fn take_output_rx(&mut self) -> Option<mpsc::Receiver<Vec<u8>>> {
         self.pty_output_rx.take()
     }
 
-    /// Send input to the PTY
     pub async fn write(&self, data: &[u8]) -> Result<(), mpsc::error::SendError<PtyCommand>> {
         self.pty_cmd_tx.send(PtyCommand::Write(data.to_vec())).await
     }
 
-    /// Resize the PTY
     pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), mpsc::error::SendError<PtyCommand>> {
         self.pty_cmd_tx.send(PtyCommand::Resize { cols, rows }).await
     }
 
-    /// Shutdown the PTY
     pub async fn shutdown(&self) {
         let _ = self.pty_cmd_tx.send(PtyCommand::Shutdown).await;
     }
 }
 
-/// Global session manager
-#[derive(Default)]
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    #[error("Docker error: {0}")]
+    Docker(#[from] DockerError),
+    #[error("PTY error: {0}")]
+    Pty(#[from] PtyError),
+}
+
 pub struct SessionManager {
     sessions: RwLock<HashMap<String, Arc<RwLock<Session>>>>,
+    container_manager: ContainerManager,
 }
 
 impl SessionManager {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> Result<Self, DockerError> {
+        let container_manager = ContainerManager::new()?;
+        Ok(Self {
             sessions: RwLock::new(HashMap::new()),
-        }
+            container_manager,
+        })
     }
 
-    /// Create a new session
-    pub async fn create_session(&self, cols: u16, rows: u16) -> Result<Arc<RwLock<Session>>, PtyError> {
-        let session = Session::new(cols, rows)?;
-        let id = session.id.clone();
-        let session = Arc::new(RwLock::new(session));
+    pub async fn create_session(&self, cols: u16, rows: u16) -> Result<Arc<RwLock<Session>>, SessionError> {
+        let id = Uuid::new_v4().to_string();
 
+        // Create Docker container
+        let container_id = self.container_manager.create_container(&id).await?;
+
+        // Spawn PTY connected to container
+        let (pty_cmd_tx, pty_output_rx) = spawn_docker_pty(container_id.clone(), cols, rows)?;
+
+        let session = Session {
+            id: id.clone(),
+            state: SessionState::Active,
+            container_id,
+            pty_cmd_tx,
+            pty_output_rx: Some(pty_output_rx),
+        };
+
+        info!(session_id = %id, "Session created");
+
+        let session = Arc::new(RwLock::new(session));
         self.sessions.write().await.insert(id.clone(), Arc::clone(&session));
         info!(session_id = %id, "Session registered");
 
         Ok(session)
     }
 
-    /// Get a session by ID
     pub async fn get_session(&self, id: &str) -> Option<Arc<RwLock<Session>>> {
         self.sessions.read().await.get(id).cloned()
     }
 
-    /// Remove a session
     pub async fn remove_session(&self, id: &str) {
         let Some(session) = self.sessions.write().await.remove(id) else {
             warn!(session_id = %id, "Attempted to remove non-existent session");
             return;
         };
-        session.read().await.shutdown().await;
+
+        let session_guard = session.read().await;
+        session_guard.shutdown().await;
+
+        // Remove the container
+        if let Err(e) = self.container_manager.remove_container(&session_guard.container_id).await {
+            error!(session_id = %id, error = %e, "Failed to remove container");
+        }
+
         info!(session_id = %id, "Session removed");
     }
 
-    /// List all session IDs
     pub async fn list_sessions(&self) -> Vec<String> {
         self.sessions.read().await.keys().cloned().collect()
     }
