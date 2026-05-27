@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Capsule Terminal</title>
+    <link rel="stylesheet" href="/lib/xterm.min.css" />
+    <style>
+        * { box-sizing: border-box; }
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            background: #0d1117;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        #app {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            padding: 12px;
+        }
+        #header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 8px;
+            flex-shrink: 0;
+        }
+        h1 { color: #c9d1d9; font-size: 18px; margin: 0; }
+        #status {
+            font-size: 13px;
+            padding: 4px 10px;
+            border-radius: 4px;
+            background: #21262d;
+            color: #8b949e;
+        }
+        #status.connected { background: #238636; color: #fff; }
+        #status.error { background: #da3633; color: #fff; }
+        #terminal-container {
+            flex: 1;
+            min-height: 0;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        #debug {
+            flex-shrink: 0;
+            color: #484f58;
+            font-size: 11px;
+            font-family: monospace;
+            margin-top: 8px;
+            max-height: 60px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <div id="header">
+            <h1>Capsule</h1>
+            <div id="status">Loading...</div>
+        </div>
+        <div id="terminal-container"></div>
+        <div id="debug"></div>
+    </div>
+
+    <script src="/lib/xterm.min.js"></script>
+    <script src="/lib/xterm-addon-fit.min.js"></script>
+    <script>
+    (function() {
+        const $ = id => document.getElementById(id);
+        const statusEl = $('status');
+        const debugEl = $('debug');
+        const container = $('terminal-container');
+
+        function log(msg) {
+            console.log('[capsule]', msg);
+            debugEl.textContent += msg + '\n';
+            debugEl.scrollTop = debugEl.scrollHeight;
+        }
+
+        function setStatus(text, state) {
+            statusEl.textContent = text;
+            statusEl.className = state || '';
+        }
+
+        if (typeof Terminal === 'undefined' || typeof FitAddon === 'undefined') {
+            setStatus('Failed to load terminal libraries', 'error');
+            return;
+        }
+
+        log('libs loaded');
+
+        const term = new Terminal({
+            cursorBlink: true,
+            cursorStyle: 'block',
+            fontSize: 14,
+            fontFamily: '"JetBrains Mono", Menlo, Monaco, "Courier New", monospace',
+            lineHeight: 1.1,
+            scrollback: 10000,
+            theme: {
+                background: '#0d1117',
+                foreground: '#c9d1d9',
+                cursor: '#58a6ff',
+                selectionBackground: '#264f78',
+                black: '#484f58',
+                red: '#ff7b72',
+                green: '#7ee787',
+                yellow: '#d29922',
+                blue: '#79c0ff',
+                magenta: '#d2a8ff',
+                cyan: '#a5d6ff',
+                white: '#c9d1d9',
+            }
+        });
+
+        const fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(container);
+
+        setTimeout(() => {
+            fitAddon.fit();
+            log('size: ' + term.cols + 'x' + term.rows);
+            connect();
+        }, 50);
+
+        let resizeTimeout = null;
+        window.addEventListener('resize', () => {
+            if (resizeTimeout) clearTimeout(resizeTimeout);
+            resizeTimeout = setTimeout(() => {
+                fitAddon.fit();
+                log('resized: ' + term.cols + 'x' + term.rows);
+            }, 100);
+        });
+
+        let ws = null;
+        const decoder = new TextDecoder();
+
+        function sendJson(msg) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(msg));
+            }
+        }
+
+        function connect() {
+            const wsUrl = 'ws://' + window.location.hostname + ':3001/ws';
+            setStatus('Connecting...', '');
+            log('connecting: ' + wsUrl);
+
+            ws = new WebSocket(wsUrl);
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                log('connected');
+                setStatus('Connected', 'connected');
+                sendJson({ type: 'resize', cols: term.cols, rows: term.rows });
+            };
+
+            ws.onmessage = (e) => {
+                // Binary = terminal output, Text = JSON control messages
+                if (e.data instanceof ArrayBuffer) {
+                    const text = decoder.decode(e.data);
+                    term.write(text);
+                } else {
+                    const msg = JSON.parse(e.data);
+                    if (msg.type === 'connected') {
+                        log('session: ' + msg.session_id.slice(0, 8));
+                    } else if (msg.type === 'error') {
+                        setStatus('Error: ' + msg.message, 'error');
+                        log('error: ' + msg.message);
+                    }
+                }
+            };
+
+            ws.onerror = () => {
+                log('ws error');
+                setStatus('Connection error', 'error');
+            };
+
+            ws.onclose = (e) => {
+                log('disconnected: ' + e.code);
+                setStatus('Disconnected', 'error');
+                ws = null;
+            };
+        }
+
+        term.onData((data) => {
+            sendJson({ type: 'terminal_input', data: data });
+        });
+
+        term.onResize((size) => {
+            log('term resize: ' + size.cols + 'x' + size.rows);
+            sendJson({ type: 'resize', cols: size.cols, rows: size.rows });
+        });
+
+        term.focus();
+    })();
+    </script>
+</body>
+</html>
