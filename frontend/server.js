@@ -13,7 +13,7 @@ const MIME_TYPES = {
 };
 
 const server = http.createServer((req, res) => {
-    const filePath = path.join(__dirname, req.url === '/' ? 'test.html' : req.url);
+    const filePath = path.join(__dirname, req.url === '/' ? 'index.html' : req.url);
     
     fs.readFile(filePath, (err, data) => {
         if (err) {
