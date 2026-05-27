@@ -2,6 +2,8 @@
 
 AI-native ephemeral coding runtime. Browser terminal connected to Docker containers via WebSocket.
 
+<img width="2559" height="1473" alt="image" src="https://github.com/user-attachments/assets/996bf3e2-eaaa-474f-973b-f7b8ed5d4f57" />
+
 ## Architecture
 
 ```
