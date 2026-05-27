@@ -200,6 +200,9 @@ async fn run_session(
 // ── Message dispatch ───────────────────────────────────────────────────────────
 
 async fn handle_ws_message(msg: Message, session: &Arc<RwLock<Session>>) -> bool {
+    // Update activity timestamp
+    session.write().await.touch();
+    
     match msg {
         Message::Text(text) => {
             let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) else {

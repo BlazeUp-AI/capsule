@@ -10,6 +10,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);  // 90 seconds without activity = dead
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -24,6 +25,7 @@ pub struct Session {
     pub container_id: String,
     pub pty_cmd_tx: mpsc::Sender<PtyCommand>,
     pub pty_output_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    pub last_activity: Instant,
 }
 
 impl Session {
@@ -45,6 +47,15 @@ impl Session {
 
     pub async fn shutdown(&self) {
         let _ = self.pty_cmd_tx.send(PtyCommand::Shutdown).await;
+    }
+
+    pub fn touch(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    pub fn is_stale(&self) -> bool {
+        matches!(self.state, SessionState::Active) && 
+            self.last_activity.elapsed() > HEARTBEAT_TIMEOUT
     }
 
     pub fn is_reconnectable(&self) -> bool {
@@ -95,6 +106,7 @@ impl SessionManager {
             container_id,
             pty_cmd_tx,
             pty_output_rx: Some(pty_output_rx),
+            last_activity: Instant::now(),
         };
 
         info!(session_id = %id, "Session created");
@@ -116,11 +128,11 @@ impl SessionManager {
         }
         
         if guard.pty_output_rx.is_none() {
-            // Output receiver is still held by another connection
             return Err(SessionError::AlreadyConnected);
         }
         
         guard.state = SessionState::Active;
+        guard.touch();
         info!(session_id = %id, "Session reconnected");
         
         drop(guard);
@@ -156,26 +168,45 @@ impl SessionManager {
         info!(session_id = %id, "Session removed");
     }
 
-    /// Clean up sessions that have been disconnected for too long
+    /// Clean up sessions that have been disconnected too long, and mark stale sessions as disconnected
     pub async fn cleanup_expired_sessions(&self) {
-        let expired: Vec<String> = {
-            let sessions = self.sessions.read().await;
-            sessions
-                .iter()
-                .filter_map(|(id, session)| {
-                    let guard = session.blocking_read();
-                    match guard.state {
-                        SessionState::Disconnected { since } if since.elapsed() >= RECONNECT_TIMEOUT => {
-                            Some(id.clone())
-                        }
-                        _ => None,
-                    }
-                })
-                .collect()
+        let session_ids: Vec<String> = {
+            self.sessions.read().await.keys().cloned().collect()
         };
 
-        for id in expired {
-            info!(session_id = %id, "Cleaning up expired session");
+        let mut stale_ids = Vec::new();
+        let mut expired_ids = Vec::new();
+
+        for id in session_ids {
+            let Some(session) = self.sessions.read().await.get(&id).cloned() else {
+                continue;
+            };
+            
+            let guard = session.read().await;
+            
+            if guard.is_stale() {
+                stale_ids.push(id.clone());
+            } else if let SessionState::Disconnected { since } = guard.state {
+                if since.elapsed() >= RECONNECT_TIMEOUT {
+                    expired_ids.push(id.clone());
+                }
+            }
+        }
+
+        // Mark stale sessions as disconnected
+        for id in stale_ids {
+            if let Some(session) = self.sessions.read().await.get(&id) {
+                let mut guard = session.write().await;
+                if guard.is_stale() {
+                    info!(session_id = %id, "Marking stale session as disconnected");
+                    guard.state = SessionState::Disconnected { since: Instant::now() };
+                }
+            }
+        }
+
+        // Remove expired sessions
+        for id in expired_ids {
+            info!(session_id = %id, "Removing expired session");
             self.remove_session(&id).await;
         }
     }
