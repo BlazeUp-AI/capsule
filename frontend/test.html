@@ -156,18 +156,16 @@
             };
 
             ws.onmessage = (e) => {
-                // Binary = terminal output, Text = JSON control messages
                 if (e.data instanceof ArrayBuffer) {
-                    const text = decoder.decode(e.data);
-                    term.write(text);
-                } else {
-                    const msg = JSON.parse(e.data);
-                    if (msg.type === 'connected') {
-                        log('session: ' + msg.session_id.slice(0, 8));
-                    } else if (msg.type === 'error') {
-                        setStatus('Error: ' + msg.message, 'error');
-                        log('error: ' + msg.message);
-                    }
+                    term.write(decoder.decode(e.data));
+                    return;
+                }
+                const msg = JSON.parse(e.data);
+                if (msg.type === 'connected') {
+                    log('session: ' + msg.session_id.slice(0, 8));
+                } else if (msg.type === 'error') {
+                    setStatus('Error: ' + msg.message, 'error');
+                    log('error: ' + msg.message);
                 }
             };
 

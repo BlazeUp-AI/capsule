@@ -102,12 +102,7 @@ fn run_pty_thread(
         // Use blocking_recv since we're in a dedicated thread
         match cmd_rx.blocking_recv() {
             Some(PtyCommand::Write(data)) => {
-                if let Err(e) = writer.write_all(&data) {
-                    error!("PTY write error: {}", e);
-                    break;
-                }
-                if let Err(e) = writer.flush() {
-                    error!("PTY flush error: {}", e);
+                if !write_to_pty(&mut writer, &data) {
                     break;
                 }
             }
@@ -150,28 +145,44 @@ fn run_pty_thread(
     Ok(())
 }
 
+/// Write data to PTY and flush. Returns false on error.
+fn write_to_pty(writer: &mut dyn Write, data: &[u8]) -> bool {
+    if let Err(e) = writer.write_all(data) {
+        error!("PTY write error: {}", e);
+        return false;
+    }
+    if let Err(e) = writer.flush() {
+        error!("PTY flush error: {}", e);
+        return false;
+    }
+    true
+}
+
 /// PTY reader thread — reads output from the PTY and forwards it to the output channel.
 fn run_reader_thread(mut reader: Box<dyn Read + Send>, output_tx: mpsc::Sender<Vec<u8>>) {
     let mut buf = [0u8; 4096];
     loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => {
-                info!("PTY EOF");
-                break;
-            }
-            Ok(n) => n,
-            Err(e) => {
-                // Non-Other errors are unexpected; log them
-                if e.kind() != std::io::ErrorKind::Other {
-                    error!("PTY read error: {}", e);
-                }
-                break;
-            }
-        };
+        let Some(n) = read_pty_chunk(&mut reader, &mut buf) else { break };
         let data = buf[..n].to_vec();
         if output_tx.blocking_send(data).is_err() {
             warn!("Output channel closed");
             break;
         }
+    }
+}
+
+/// Read one chunk from the PTY. Returns None on EOF or error.
+fn read_pty_chunk(reader: &mut Box<dyn Read + Send>, buf: &mut [u8]) -> Option<usize> {
+    match reader.read(buf) {
+        Ok(0) => {
+            info!("PTY EOF");
+            None
+        }
+        Ok(n) => Some(n),
+        Err(e) if e.kind() != std::io::ErrorKind::Other => {
+            error!("PTY read error: {}", e);
+            None
+        }
+        Err(_) => None,
     }
 }

@@ -7,7 +7,7 @@ use axum::response::IntoResponse;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 // ── Message types ──────────────────────────────────────────────────────────────
@@ -96,11 +96,9 @@ async fn wait_for_initial_size(
             Err(_) => return Some((80, 24)), // timeout, use defaults
         };
 
-        if let Message::Text(text) = msg {
-            if let Ok(ClientMessage::Resize { cols, rows }) = serde_json::from_str(&text) {
-                return Some((cols, rows));
-            }
-        }
+        let Message::Text(text) = msg else { continue };
+        let Ok(ClientMessage::Resize { cols, rows }) = serde_json::from_str(&text) else { continue };
+        return Some((cols, rows));
     }
 }
 
