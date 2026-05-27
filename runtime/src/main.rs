@@ -3,6 +3,7 @@
 use axum::{routing::get, Router};
 use capsule_runtime::{session::SessionManager, websocket::ws_handler};
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -27,6 +28,16 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Spawn cleanup task
+    let sessions_for_cleanup = Arc::clone(&sessions);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            sessions_for_cleanup.cleanup_expired_sessions().await;
+        }
+    });
 
     let cors = CorsLayer::new()
         .allow_origin(Any)

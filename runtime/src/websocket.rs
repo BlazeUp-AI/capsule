@@ -1,8 +1,8 @@
 //! Capsule Runtime - WebSocket handler
 
-use crate::session::{Session, SessionManager, SessionState};
+use crate::session::{Session, SessionError, SessionManager};
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
+use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -24,64 +24,107 @@ pub enum ClientMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     Connected { session_id: String },
+    Reconnected { session_id: String },
     Error { message: String },
     Pong,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WsQuery {
+    session_id: Option<String>,
 }
 
 // ── WebSocket handler ──────────────────────────────────────────────────────────
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
+    Query(query): Query<WsQuery>,
     State(sessions): State<Arc<SessionManager>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, sessions))
+    ws.on_upgrade(|socket| handle_socket(socket, query.session_id, sessions))
 }
 
-async fn handle_socket(socket: WebSocket, sessions: Arc<SessionManager>) {
+async fn handle_socket(
+    socket: WebSocket,
+    session_id: Option<String>,
+    sessions: Arc<SessionManager>,
+) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Wait for initial resize to get correct terminal dimensions
-    let (cols, rows) = match wait_for_initial_size(&mut ws_receiver).await {
-        Some(size) => size,
-        None => {
-            warn!("Client disconnected before sending initial size");
-            return;
+    // Try to reconnect or create new session
+    let (session, is_reconnect) = match session_id {
+        Some(id) => {
+            match sessions.reconnect_session(&id).await {
+                Ok(s) => (s, true),
+                Err(SessionError::NotFound) => {
+                    warn!(session_id = %id, "Reconnect failed: session not found");
+                    let msg = ServerMessage::Error { message: "Session not found".into() };
+                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
+                    return;
+                }
+                Err(SessionError::NotReconnectable) => {
+                    warn!(session_id = %id, "Reconnect failed: session expired");
+                    let msg = ServerMessage::Error { message: "Session expired".into() };
+                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
+                    return;
+                }
+                Err(e) => {
+                    error!(session_id = %id, error = %e, "Reconnect failed");
+                    let msg = ServerMessage::Error { message: e.to_string() };
+                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
+                    return;
+                }
+            }
         }
-    };
-    info!(cols, rows, "Got initial terminal size");
+        None => {
+            // Wait for initial resize to get terminal dimensions
+            let (cols, rows) = match wait_for_initial_size(&mut ws_receiver).await {
+                Some(size) => size,
+                None => {
+                    warn!("Client disconnected before sending initial size");
+                    return;
+                }
+            };
+            info!(cols, rows, "Got initial terminal size");
 
-    // Create session with correct size
-    let session = match sessions.create_session(cols, rows).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to create session: {}", e);
-            let msg = ServerMessage::Error { message: e.to_string() };
-            let _ = ws_sender
-                .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
-                .await;
-            return;
+            match sessions.create_session(cols, rows).await {
+                Ok(s) => (s, false),
+                Err(e) => {
+                    error!("Failed to create session: {}", e);
+                    let msg = ServerMessage::Error { message: e.to_string() };
+                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
+                    return;
+                }
+            }
         }
     };
 
     let session_id = session.read().await.id.clone();
-    info!(session_id = %session_id, "Session created");
 
-    // Send connected confirmation
-    let connected_msg = ServerMessage::Connected { session_id: session_id.clone() };
+    // Send connected/reconnected confirmation
+    let confirm_msg = if is_reconnect {
+        info!(session_id = %session_id, "Client reconnected");
+        ServerMessage::Reconnected { session_id: session_id.clone() }
+    } else {
+        info!(session_id = %session_id, "Session created");
+        ServerMessage::Connected { session_id: session_id.clone() }
+    };
+
     if ws_sender
-        .send(Message::Text(serde_json::to_string(&connected_msg).unwrap().into()))
+        .send(Message::Text(serde_json::to_string(&confirm_msg).unwrap().into()))
         .await
         .is_err()
     {
         return;
     }
 
-    run_session(session.clone(), ws_sender, ws_receiver).await;
+    // Run the session and get back the output receiver when done
+    let output_rx = run_session(session.clone(), ws_sender, ws_receiver).await;
 
-    // Cleanup
-    session.write().await.state = SessionState::Disconnected;
-    sessions.remove_session(&session_id).await;
-    info!(session_id = %session_id, "Session cleaned up");
+    // Mark session as disconnected (keeps container alive for reconnect)
+    if let Some(rx) = output_rx {
+        sessions.mark_disconnected(&session_id, rx).await;
+    }
 }
 
 async fn wait_for_initial_size(
@@ -93,7 +136,7 @@ async fn wait_for_initial_size(
         let msg = match tokio::time::timeout(timeout, ws_receiver.next()).await {
             Ok(Some(Ok(msg))) => msg,
             Ok(Some(Err(_))) | Ok(None) => return None,
-            Err(_) => return Some((80, 24)), // timeout, use defaults
+            Err(_) => return Some((80, 24)),
         };
 
         let Message::Text(text) = msg else { continue };
@@ -102,40 +145,55 @@ async fn wait_for_initial_size(
     }
 }
 
+/// Run session and return the output receiver when done (for reconnect support)
 async fn run_session(
     session: Arc<RwLock<Session>>,
     mut ws_sender: futures::stream::SplitSink<WebSocket, Message>,
     mut ws_receiver: futures::stream::SplitStream<WebSocket>,
-) {
-    let mut pty_output_rx = match session.write().await.take_output_rx() {
-        Some(rx) => rx,
-        None => return,
-    };
+) -> Option<tokio::sync::mpsc::Receiver<Vec<u8>>> {
+    let mut pty_output_rx = session.write().await.take_output_rx()?;
 
     let session_for_receiver = Arc::clone(&session);
 
-    // Task: PTY -> WebSocket (binary frames for terminal data)
+    // Shared flag to signal shutdown
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_for_ws = Arc::clone(&shutdown);
+
+    // Task: PTY -> WebSocket
     let pty_to_ws = tokio::spawn(async move {
-        while let Some(data) = pty_output_rx.recv().await {
-            // Send terminal output as raw binary - no JSON overhead
-            if ws_sender.send(Message::Binary(data.into())).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                data = pty_output_rx.recv() => {
+                    match data {
+                        Some(data) => {
+                            if ws_sender.send(Message::Binary(data.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = shutdown.notified() => {
+                    break;
+                }
             }
         }
+        pty_output_rx
     });
 
     // Task: WebSocket -> PTY
-    let ws_to_pty = tokio::spawn(async move {
-        while let Some(Ok(msg)) = ws_receiver.next().await {
-            if !handle_ws_message(msg, &session_for_receiver).await {
-                break;
-            }
+    while let Some(Ok(msg)) = ws_receiver.next().await {
+        if !handle_ws_message(msg, &session_for_receiver).await {
+            break;
         }
-    });
+    }
 
-    tokio::select! {
-        _ = pty_to_ws => {},
-        _ = ws_to_pty => {},
+    // Signal PTY task to stop and get the receiver back
+    shutdown_for_ws.notify_one();
+    
+    match pty_to_ws.await {
+        Ok(rx) => Some(rx),
+        Err(_) => None,
     }
 }
 
@@ -150,7 +208,6 @@ async fn handle_ws_message(msg: Message, session: &Arc<RwLock<Session>>) -> bool
             handle_client_message(client_msg, session).await
         }
         Message::Binary(data) => {
-            // Binary from client = raw terminal input
             session.read().await.write(&data).await.is_ok()
         }
         Message::Close(_) => false,
@@ -168,6 +225,6 @@ async fn handle_client_message(msg: ClientMessage, session: &Arc<RwLock<Session>
             let _ = session.read().await.resize(cols, rows).await;
             true
         }
-        ClientMessage::Ping => true, // Just keep connection alive
+        ClientMessage::Ping => true,
     }
 }

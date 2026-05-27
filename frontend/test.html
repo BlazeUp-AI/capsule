@@ -34,6 +34,7 @@
             color: #8b949e;
         }
         #status.connected { background: #238636; color: #fff; }
+        #status.reconnecting { background: #9e6a03; color: #fff; }
         #status.error { background: #da3633; color: #fff; }
         #terminal-container {
             flex: 1;
@@ -71,6 +72,15 @@
         const statusEl = $('status');
         const debugEl = $('debug');
         const container = $('terminal-container');
+
+        const SESSION_KEY = 'capsule_session_id';
+        const RECONNECT_DELAY = 2000;
+        const MAX_RECONNECT_ATTEMPTS = 5;
+
+        let reconnectAttempts = 0;
+        let sessionId = sessionStorage.getItem(SESSION_KEY);
+        
+        log('init sessionId: ' + (sessionId ? sessionId.slice(0,8) : 'null'));
 
         function log(msg) {
             console.log('[capsule]', msg);
@@ -142,17 +152,32 @@
         }
 
         function connect() {
-            const wsUrl = 'ws://' + window.location.hostname + ':3001/ws';
-            setStatus('Connecting...', '');
-            log('connecting: ' + wsUrl);
+            let wsUrl = 'ws://' + window.location.hostname + ':3001/ws';
+            
+            // If we have a session ID, try to reconnect
+            if (sessionId) {
+                wsUrl += '?session_id=' + encodeURIComponent(sessionId);
+                setStatus('Reconnecting...', 'reconnecting');
+                log('reconnecting: ' + sessionId.slice(0, 8));
+            } else {
+                setStatus('Connecting...', '');
+                log('connecting: ' + wsUrl);
+            }
 
             ws = new WebSocket(wsUrl);
             ws.binaryType = 'arraybuffer';
 
             ws.onopen = () => {
-                log('connected');
-                setStatus('Connected', 'connected');
-                sendJson({ type: 'resize', cols: term.cols, rows: term.rows });
+                log('ws open');
+                reconnectAttempts = 0;
+                
+                // Only send initial size for new sessions
+                if (!sessionId) {
+                    sendJson({ type: 'resize', cols: term.cols, rows: term.rows });
+                } else {
+                    // For reconnect, send resize to sync terminal size
+                    sendJson({ type: 'resize', cols: term.cols, rows: term.rows });
+                }
             };
 
             ws.onmessage = (e) => {
@@ -162,22 +187,44 @@
                 }
                 const msg = JSON.parse(e.data);
                 if (msg.type === 'connected') {
-                    log('session: ' + msg.session_id.slice(0, 8));
+                    sessionId = msg.session_id;
+                    sessionStorage.setItem(SESSION_KEY, sessionId);
+                    log('stored sessionId: ' + sessionId.slice(0, 8));
+                    setStatus('Connected', 'connected');
+                    log('session: ' + sessionId.slice(0, 8));
+                } else if (msg.type === 'reconnected') {
+                    sessionId = msg.session_id;
+                    setStatus('Reconnected', 'connected');
+                    log('reconnected: ' + sessionId.slice(0, 8));
                 } else if (msg.type === 'error') {
                     setStatus('Error: ' + msg.message, 'error');
                     log('error: ' + msg.message);
+                    // Clear session ID if session not found/expired
+                    if (msg.message.includes('not found') || msg.message.includes('expired')) {
+                        sessionId = null;
+                        sessionStorage.removeItem(SESSION_KEY);
+                        // Try creating new session
+                        setTimeout(connect, 1000);
+                    }
                 }
             };
 
             ws.onerror = () => {
                 log('ws error');
-                setStatus('Connection error', 'error');
             };
 
             ws.onclose = (e) => {
                 log('disconnected: ' + e.code);
                 setStatus('Disconnected', 'error');
                 ws = null;
+
+                // Attempt to reconnect
+                if (sessionId && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                    reconnectAttempts++;
+                    log('reconnect attempt ' + reconnectAttempts + '/' + MAX_RECONNECT_ATTEMPTS);
+                    setStatus('Reconnecting (' + reconnectAttempts + ')...', 'reconnecting');
+                    setTimeout(connect, RECONNECT_DELAY);
+                }
             };
         }
 
