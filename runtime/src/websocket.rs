@@ -51,52 +51,15 @@ async fn handle_socket(
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    // Try to reconnect or create new session
     let (session, is_reconnect) = match session_id {
-        Some(id) => {
-            match sessions.reconnect_session(&id).await {
-                Ok(s) => (s, true),
-                Err(SessionError::NotFound) => {
-                    warn!(session_id = %id, "Reconnect failed: session not found");
-                    let msg = ServerMessage::Error { message: "Session not found".into() };
-                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
-                    return;
-                }
-                Err(SessionError::NotReconnectable) => {
-                    warn!(session_id = %id, "Reconnect failed: session expired");
-                    let msg = ServerMessage::Error { message: "Session expired".into() };
-                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
-                    return;
-                }
-                Err(e) => {
-                    error!(session_id = %id, error = %e, "Reconnect failed");
-                    let msg = ServerMessage::Error { message: e.to_string() };
-                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
-                    return;
-                }
-            }
-        }
-        None => {
-            // Wait for initial resize to get terminal dimensions
-            let (cols, rows) = match wait_for_initial_size(&mut ws_receiver).await {
-                Some(size) => size,
-                None => {
-                    warn!("Client disconnected before sending initial size");
-                    return;
-                }
-            };
-            info!(cols, rows, "Got initial terminal size");
-
-            match sessions.create_session(cols, rows).await {
-                Ok(s) => (s, false),
-                Err(e) => {
-                    error!("Failed to create session: {}", e);
-                    let msg = ServerMessage::Error { message: e.to_string() };
-                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
-                    return;
-                }
-            }
-        }
+        Some(id) => match resolve_reconnect(&id, &sessions, &mut ws_sender).await {
+            Some(s) => s,
+            None => return,
+        },
+        None => match resolve_new_session(&sessions, &mut ws_sender, &mut ws_receiver).await {
+            Some(s) => s,
+            None => return,
+        },
     };
 
     let session_id = session.read().await.id.clone();
@@ -126,6 +89,69 @@ async fn handle_socket(
         sessions.mark_disconnected(&session_id, rx).await;
     }
 }
+
+// ── Session resolution helpers ────────────────────────────────────────────────
+
+/// Resolve a reconnect request, sending an error and returning None if it fails.
+async fn resolve_reconnect(
+    id: &str,
+    sessions: &Arc<SessionManager>,
+    ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+) -> Option<(Arc<RwLock<Session>>, bool)> {
+    match sessions.reconnect_session(id).await {
+        Ok(s) => Some((s, true)),
+        Err(SessionError::NotFound) => {
+            warn!(session_id = %id, "Reconnect failed: session not found");
+            send_error(ws_sender, "Session not found").await;
+            None
+        }
+        Err(SessionError::NotReconnectable) => {
+            warn!(session_id = %id, "Reconnect failed: session expired");
+            send_error(ws_sender, "Session expired").await;
+            None
+        }
+        Err(e) => {
+            error!(session_id = %id, error = %e, "Reconnect failed");
+            send_error(ws_sender, &e.to_string()).await;
+            None
+        }
+    }
+}
+
+/// Wait for an initial resize, create a new session, and return it. Returns None on failure.
+async fn resolve_new_session(
+    sessions: &Arc<SessionManager>,
+    ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    ws_receiver: &mut futures::stream::SplitStream<WebSocket>,
+) -> Option<(Arc<RwLock<Session>>, bool)> {
+    let (cols, rows) = match wait_for_initial_size(ws_receiver).await {
+        Some(size) => size,
+        None => {
+            warn!("Client disconnected before sending initial size");
+            return None;
+        }
+    };
+    info!(cols, rows, "Got initial terminal size");
+
+    match sessions.create_session(cols, rows).await {
+        Ok(s) => Some((s, false)),
+        Err(e) => {
+            error!("Failed to create session: {}", e);
+            send_error(ws_sender, &e.to_string()).await;
+            None
+        }
+    }
+}
+
+/// Send an error message over the WebSocket.
+async fn send_error(
+    ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    message: &str,
+) {
+    let msg = ServerMessage::Error { message: message.into() };
+    let _ = ws_sender.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
+}
+
 
 async fn wait_for_initial_size(
     ws_receiver: &mut futures::stream::SplitStream<WebSocket>,
@@ -163,19 +189,15 @@ async fn run_session(
     let pty_to_ws = tokio::spawn(async move {
         loop {
             tokio::select! {
-                data = pty_output_rx.recv() => {
-                    match data {
-                        Some(data) => {
-                            if ws_sender.send(Message::Binary(data.into())).await.is_err() {
-                                break;
-                            }
+                data = pty_output_rx.recv() => match data {
+                    Some(data) => {
+                        if ws_sender.send(Message::Binary(data.into())).await.is_err() {
+                            break;
                         }
-                        None => break,
                     }
-                }
-                _ = shutdown.notified() => {
-                    break;
-                }
+                    None => break,
+                },
+                _ = shutdown.notified() => break,
             }
         }
         pty_output_rx
@@ -190,7 +212,7 @@ async fn run_session(
 
     // Signal PTY task to stop and get the receiver back
     shutdown_for_ws.notify_one();
-    
+
     match pty_to_ws.await {
         Ok(rx) => Some(rx),
         Err(_) => None,

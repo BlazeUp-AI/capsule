@@ -185,22 +185,23 @@ impl SessionManager {
             let guard = session.read().await;
             
             if guard.is_stale() {
-                stale_ids.push(id.clone());
+                stale_ids.push(id);
             } else if let SessionState::Disconnected { since } = guard.state {
                 if since.elapsed() >= RECONNECT_TIMEOUT {
-                    expired_ids.push(id.clone());
+                    expired_ids.push(id);
                 }
             }
         }
 
         // Mark stale sessions as disconnected
         for id in stale_ids {
-            if let Some(session) = self.sessions.read().await.get(&id) {
-                let mut guard = session.write().await;
-                if guard.is_stale() {
-                    info!(session_id = %id, "Marking stale session as disconnected");
-                    guard.state = SessionState::Disconnected { since: Instant::now() };
-                }
+            let Some(session) = self.sessions.read().await.get(&id).cloned() else {
+                continue;
+            };
+            let mut guard = session.write().await;
+            if guard.is_stale() {
+                info!(session_id = %id, "Marking stale session as disconnected");
+                guard.state = SessionState::Disconnected { since: Instant::now() };
             }
         }
 
