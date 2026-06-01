@@ -74,7 +74,7 @@ pub fn check_auth(required_token: &Option<String>, headers: &HeaderMap) -> Resul
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 pub async fn create_session(
-    State((sessions, api_token)): State<(Arc<SessionManager>, Option<String>)>,
+    State((sessions, api_token, _)): State<(Arc<SessionManager>, Option<String>, Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>)>,
     headers: HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
@@ -112,7 +112,7 @@ pub async fn create_session(
 }
 
 pub async fn get_session(
-    State((sessions, api_token)): State<(Arc<SessionManager>, Option<String>)>,
+    State((sessions, api_token, _)): State<(Arc<SessionManager>, Option<String>, Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>)>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
@@ -148,7 +148,7 @@ pub async fn get_session(
 }
 
 pub async fn exec_in_session(
-    State((sessions, api_token)): State<(Arc<SessionManager>, Option<String>)>,
+    State((sessions, api_token, _)): State<(Arc<SessionManager>, Option<String>, Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>)>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
     Json(req): Json<ExecRequest>,
@@ -185,7 +185,7 @@ pub async fn exec_in_session(
 }
 
 pub async fn delete_session(
-    State((sessions, api_token)): State<(Arc<SessionManager>, Option<String>)>,
+    State((sessions, api_token, _)): State<(Arc<SessionManager>, Option<String>, Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>)>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {

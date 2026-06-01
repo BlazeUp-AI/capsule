@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod docker;
+pub mod observal;
 pub mod pty;
 pub mod session;
 pub mod websocket;

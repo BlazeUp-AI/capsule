@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 // ── Message types ──────────────────────────────────────────────────────────────
 
@@ -50,15 +51,16 @@ pub struct WsQuery {
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(query): Query<WsQuery>,
-    State((sessions, _)): State<(Arc<SessionManager>, Option<String>)>,
+    State((sessions, _, observal)): State<(Arc<SessionManager>, Option<String>, Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>)>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, query.session_id, sessions))
+    ws.on_upgrade(|socket| handle_socket(socket, query.session_id, sessions, observal))
 }
 
 async fn handle_socket(
     socket: WebSocket,
     session_id: Option<String>,
     sessions: Arc<SessionManager>,
+    observal: Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>,
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
@@ -67,7 +69,7 @@ async fn handle_socket(
             Some(s) => s,
             None => return,
         },
-        None => match resolve_new_session(&sessions, &mut ws_sender, &mut ws_receiver).await {
+        None => match resolve_new_session(&sessions, &mut ws_sender, &mut ws_receiver, &observal).await {
             Some(s) => s,
             None => return,
         },
@@ -134,8 +136,9 @@ async fn resolve_new_session(
     sessions: &Arc<SessionManager>,
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     ws_receiver: &mut futures::stream::SplitStream<WebSocket>,
+    observal: &Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>,
 ) -> Option<(Arc<RwLock<Session>>, bool)> {
-    let (cols, rows, config) = match wait_for_init_messages(ws_receiver).await {
+    let (cols, rows, mut config) = match wait_for_init_messages(ws_receiver).await {
         Some(result) => result,
         None => {
             warn!("Client disconnected before sending initial messages");
@@ -145,6 +148,28 @@ async fn resolve_new_session(
     info!(cols, rows, "Creating session");
 
     send_state(ws_sender, "provisioning", "creating container").await;
+
+    // Provision Observal user (non-blocking — if it fails, session still works)
+    let session_id_preview = Uuid::new_v4().to_string();
+    let observal_guard = observal.read().await;
+    if let Some(client) = observal_guard.as_ref() {
+        match client.provision_session_user(&session_id_preview).await {
+            Ok(tokens) => {
+                config
+                    .env_vars
+                    .insert("OBSERVAL_TOKEN".to_string(), tokens.access_token.clone());
+                config.env_vars.insert(
+                    "OBSERVAL_SERVER_URL".to_string(),
+                    client.api_url().to_string(),
+                );
+                info!("Observal user provisioned for session");
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to provision Observal user, continuing without telemetry");
+            }
+        }
+    }
+    drop(observal_guard);
 
     match sessions.create_session(cols, rows, config).await {
         Ok(s) => Some((s, false)),
