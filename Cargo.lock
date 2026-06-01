@@ -190,6 +190,7 @@ name = "capsule-runtime"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "bollard",
  "bytes",
  "futures",

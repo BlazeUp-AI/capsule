@@ -1,8 +1,9 @@
 //! Capsule Runtime - REST API handlers
 
+use base64::Engine;
 use crate::docker::ContainerConfig;
 use crate::session::SessionManager;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -208,5 +209,157 @@ fn truncate_output(s: String) -> String {
         truncated
     } else {
         s
+    }
+}
+
+// ── File API ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct FileQuery {
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    #[serde(rename = "type")]
+    pub file_type: String, // "f" for file, "d" for directory
+    pub size: u64,
+}
+
+pub async fn list_files(
+    State((sessions, api_token, _)): State<(Arc<SessionManager>, Option<String>, Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>)>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Query(query): Query<FileQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = check_auth(&api_token, &headers) {
+        return status.into_response();
+    }
+
+    let dir_path = query.path.unwrap_or_else(|| "/workspace".to_string());
+
+    let result = sessions
+        .exec_in_session(
+            &session_id,
+            vec![
+                "find".to_string(),
+                dir_path.clone(),
+                "-maxdepth".to_string(),
+                "1".to_string(),
+                "-not".to_string(),
+                "-path".to_string(),
+                dir_path.clone(),
+                "-printf".to_string(),
+                "%f\\t%y\\t%s\\t%p\\n".to_string(),
+            ],
+            Duration::from_secs(10),
+        )
+        .await;
+
+    match result {
+        Ok(exec_result) if exec_result.exit_code == 0 => {
+            let entries: Vec<FileEntry> = exec_result
+                .stdout
+                .lines()
+                .filter_map(|line| {
+                    let parts: Vec<&str> = line.splitn(4, '\t').collect();
+                    if parts.len() < 4 {
+                        return None;
+                    }
+                    let file_type = match parts[1] {
+                        "d" => "d",
+                        _ => "f",
+                    };
+                    Some(FileEntry {
+                        name: parts[0].to_string(),
+                        file_type: file_type.to_string(),
+                        size: parts[2].parse().unwrap_or(0),
+                        path: parts[3].to_string(),
+                    })
+                })
+                .collect();
+
+            Json(entries).into_response()
+        }
+        Ok(_) => (StatusCode::NOT_FOUND, "Directory not found").into_response(),
+        Err(crate::session::SessionError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub async fn read_file(
+    State((sessions, api_token, _)): State<(Arc<SessionManager>, Option<String>, Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>)>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Query(query): Query<FileQuery>,
+) -> impl IntoResponse {
+    if let Err(status) = check_auth(&api_token, &headers) {
+        return status.into_response();
+    }
+
+    let file_path = match query.path {
+        Some(p) => p,
+        None => return (StatusCode::BAD_REQUEST, "path parameter required").into_response(),
+    };
+
+    let result = sessions
+        .exec_in_session(
+            &session_id,
+            vec!["cat".to_string(), file_path],
+            Duration::from_secs(10),
+        )
+        .await;
+
+    match result {
+        Ok(exec_result) if exec_result.exit_code == 0 => {
+            let content = truncate_output(exec_result.stdout);
+            (StatusCode::OK, content).into_response()
+        }
+        Ok(_) => (StatusCode::NOT_FOUND, "File not found").into_response(),
+        Err(crate::session::SessionError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub async fn write_file(
+    State((sessions, api_token, _)): State<(Arc<SessionManager>, Option<String>, Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>)>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Query(query): Query<FileQuery>,
+    body: String,
+) -> impl IntoResponse {
+    if let Err(status) = check_auth(&api_token, &headers) {
+        return status.into_response();
+    }
+
+    let file_path = match query.path {
+        Some(p) => p,
+        None => return (StatusCode::BAD_REQUEST, "path parameter required").into_response(),
+    };
+
+    // Encode content as base64 to avoid shell injection.
+    // The container decodes it: echo <b64> | base64 -d > file
+    let encoded = base64::engine::general_purpose::STANDARD.encode(body.as_bytes());
+    let command = format!("echo '{}' | base64 -d > '{}'", encoded, file_path.replace('\'', "'\\''"));
+
+    let result = sessions
+        .exec_in_session(
+            &session_id,
+            vec!["sh".to_string(), "-c".to_string(), command],
+            Duration::from_secs(10),
+        )
+        .await;
+
+    match result {
+        Ok(exec_result) if exec_result.exit_code == 0 => {
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(exec_result) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, exec_result.stderr).into_response()
+        }
+        Err(crate::session::SessionError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

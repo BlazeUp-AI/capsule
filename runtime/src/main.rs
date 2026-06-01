@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, Request, State},
     http::{header, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use capsule_runtime::{api, observal::ObservalClient, session::SessionManager, websocket::ws_handler};
@@ -137,6 +137,16 @@ async fn main() {
         .route(
             "/api/sessions/{session_id}/exec",
             post(api::exec_in_session),
+        )
+        // File API
+        .route("/api/sessions/{session_id}/files", get(api::list_files))
+        .route(
+            "/api/sessions/{session_id}/files/content",
+            get(api::read_file),
+        )
+        .route(
+            "/api/sessions/{session_id}/files/content",
+            put(api::write_file),
         )
         // Observal dashboard proxy
         .route("/observal/{session_id}/{*path}", get(observal_proxy))
