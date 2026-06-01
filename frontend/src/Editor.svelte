@@ -10,13 +10,13 @@
 
   onMount(() => {
     if (active && sessionId) {
-      loadFileTree('/');
+      loadFileTree('/workspace');
     }
   });
 
   $effect(() => {
-    if (active && sessionId && files.length === 0) {
-      loadFileTree('/');
+    if (active && sessionId) {
+      loadFileTree('/workspace');
     }
   });
 

@@ -34,7 +34,13 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    Connected { session_id: String },
+    Connected {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        observal_token: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        observal_refresh_token: Option<String>,
+    },
     Reconnected { session_id: String },
     SessionState { state: String, detail: String },
     Error { message: String },
@@ -64,13 +70,13 @@ async fn handle_socket(
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    let (session, is_reconnect) = match session_id {
+    let (session, is_reconnect, obs_token, obs_refresh) = match session_id {
         Some(id) => match resolve_reconnect(&id, &sessions, &mut ws_sender).await {
-            Some(s) => s,
+            Some(s) => (s.0, s.1, None, None),
             None => return,
         },
         None => match resolve_new_session(&sessions, &mut ws_sender, &mut ws_receiver, &observal).await {
-            Some(s) => s,
+            Some(s) => (s.0, s.1, s.2, s.3),
             None => return,
         },
     };
@@ -83,7 +89,11 @@ async fn handle_socket(
         ServerMessage::Reconnected { session_id: session_id.clone() }
     } else {
         info!(session_id = %session_id, "Session created");
-        ServerMessage::Connected { session_id: session_id.clone() }
+        ServerMessage::Connected {
+            session_id: session_id.clone(),
+            observal_token: obs_token,
+            observal_refresh_token: obs_refresh,
+        }
     };
 
     if ws_sender
@@ -137,7 +147,7 @@ async fn resolve_new_session(
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     ws_receiver: &mut futures::stream::SplitStream<WebSocket>,
     observal: &Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>,
-) -> Option<(Arc<RwLock<Session>>, bool)> {
+) -> Option<(Arc<RwLock<Session>>, bool, Option<String>, Option<String>)> {
     let (cols, rows, mut config) = match wait_for_init_messages(ws_receiver).await {
         Some(result) => result,
         None => {
@@ -149,30 +159,43 @@ async fn resolve_new_session(
 
     send_state(ws_sender, "provisioning", "creating container").await;
 
-    // Provision Observal user (non-blocking — if it fails, session still works)
+    // Provision Observal user — non-blocking, skip if unavailable
     let session_id_preview = Uuid::new_v4().to_string();
+    let mut observal_access_token: Option<String> = None;
+    let mut observal_refresh_token: Option<String> = None;
+
     let observal_guard = observal.read().await;
     if let Some(client) = observal_guard.as_ref() {
-        match client.provision_session_user(&session_id_preview).await {
-            Ok(tokens) => {
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(3),
+            client.provision_session_user(&session_id_preview),
+        )
+        .await
+        {
+            Ok(Ok(tokens)) => {
                 config
                     .env_vars
                     .insert("OBSERVAL_TOKEN".to_string(), tokens.access_token.clone());
                 config.env_vars.insert(
                     "OBSERVAL_SERVER_URL".to_string(),
-                    client.api_url().to_string(),
+                    client.container_api_url().to_string(),
                 );
+                observal_access_token = Some(tokens.access_token);
+                observal_refresh_token = Some(tokens.refresh_token);
                 info!("Observal user provisioned for session");
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(error = %e, "Failed to provision Observal user, continuing without telemetry");
+            }
+            Err(_) => {
+                warn!("Observal provisioning timed out, continuing without telemetry");
             }
         }
     }
     drop(observal_guard);
 
     match sessions.create_session(cols, rows, config).await {
-        Ok(s) => Some((s, false)),
+        Ok(s) => Some((s, false, observal_access_token, observal_refresh_token)),
         Err(e) => {
             error!("Failed to create session: {}", e);
             send_error(ws_sender, &e.to_string()).await;
@@ -216,13 +239,14 @@ async fn wait_for_init_messages(
     let mut cols = 80u16;
     let mut rows = 24u16;
     let mut got_resize = false;
+    let mut got_config = false;
     let mut config = ContainerConfig::default();
 
     loop {
         let msg = match tokio::time::timeout(timeout, ws_receiver.next()).await {
             Ok(Some(Ok(msg))) => msg,
             Ok(Some(Err(_))) | Ok(None) => return None,
-            Err(_) => break, // timeout — use defaults
+            Err(_) => break, // timeout — use whatever we have
         };
 
         let Message::Text(text) = msg else { continue };
@@ -235,38 +259,6 @@ async fn wait_for_init_messages(
                 cols = c;
                 rows = r;
                 got_resize = true;
-                // If we already have resize but no config after 500ms, proceed
-                if got_resize {
-                    // Give a short window for config to arrive
-                    let brief = tokio::time::Duration::from_millis(500);
-                    match tokio::time::timeout(brief, ws_receiver.next()).await {
-                        Ok(Some(Ok(Message::Text(t)))) => {
-                            if let Ok(ClientMessage::SessionConfig {
-                                credentials,
-                                agent,
-                                image,
-                                enable_dind,
-                                repo,
-                            }) = serde_json::from_str(&t)
-                            {
-                                let mut env_vars = credentials.unwrap_or_default();
-                                if let Some(a) = agent {
-                                    env_vars.insert("CAPSULE_AGENT".to_string(), a);
-                                }
-                                if let Some(r) = repo {
-                                    env_vars.insert("CAPSULE_REPO".to_string(), r);
-                                }
-                                config = ContainerConfig {
-                                    image,
-                                    env_vars,
-                                    enable_dind: enable_dind.unwrap_or(false),
-                                };
-                            }
-                        }
-                        _ => {} // No config — use defaults
-                    }
-                    break;
-                }
             }
             ClientMessage::SessionConfig {
                 credentials,
@@ -287,14 +279,55 @@ async fn wait_for_init_messages(
                     env_vars,
                     enable_dind: enable_dind.unwrap_or(false),
                 };
-                if got_resize {
-                    break;
-                }
+                got_config = true;
             }
             _ => continue,
         }
+
+        // Once we have both (or resize + timeout for config), proceed
+        if got_resize && got_config {
+            break;
+        }
+
+        // If we have resize but not config, give a brief window
+        if got_resize && !got_config {
+            let brief = tokio::time::Duration::from_millis(1000);
+            let deadline = tokio::time::Instant::now() + brief;
+            while tokio::time::Instant::now() < deadline {
+                match tokio::time::timeout_at(deadline, ws_receiver.next()).await {
+                    Ok(Some(Ok(Message::Text(t)))) => {
+                        if let Ok(ClientMessage::SessionConfig {
+                            credentials,
+                            agent,
+                            image,
+                            enable_dind,
+                            repo,
+                        }) = serde_json::from_str(&t)
+                        {
+                            let mut env_vars = credentials.unwrap_or_default();
+                            if let Some(a) = agent {
+                                env_vars.insert("CAPSULE_AGENT".to_string(), a);
+                            }
+                            if let Some(r) = repo {
+                                env_vars.insert("CAPSULE_REPO".to_string(), r);
+                            }
+                            config = ContainerConfig {
+                                image,
+                                env_vars,
+                                enable_dind: enable_dind.unwrap_or(false),
+                            };
+                            got_config = true;
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            break;
+        }
     }
 
+    info!(got_resize, got_config, env_count = config.env_vars.len(), "Init messages received");
     Some((cols, rows, config))
 }
 

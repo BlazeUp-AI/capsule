@@ -72,6 +72,6 @@ WORKDIR /workspace
 # ── Shell configuration ─────────────────────────────────────────────────────────
 
 RUN echo 'fastfetch' >> ~/.bashrc \
-    && echo '[ -n "$OBSERVAL_TOKEN" ] && observal doctor patch --all --all-ides >/dev/null 2>&1 || true' >> ~/.bashrc
+    && echo '[ -n "$OBSERVAL_TOKEN" ] && mkdir -p ~/.observal && printf "{\"server_url\":\"%s\",\"access_token\":\"%s\"}" "$OBSERVAL_SERVER_URL" "$OBSERVAL_TOKEN" > ~/.observal/config.json && observal doctor patch --all --all-ides >/dev/null 2>&1 || true' >> ~/.bashrc
 
 CMD ["/bin/bash"]

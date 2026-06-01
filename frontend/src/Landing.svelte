@@ -3,10 +3,14 @@
 
   const PROVIDERS = {
     anthropic: { label: 'Anthropic', fields: [{ key: 'ANTHROPIC_API_KEY', label: 'API Key', placeholder: 'sk-ant-...' }] },
-    bedrock: { label: 'AWS Bedrock', fields: [
+    bedrock: { label: 'AWS Bedrock (IAM Keys)', fields: [
       { key: 'AWS_ACCESS_KEY_ID', label: 'Access Key ID', placeholder: 'AKIA...' },
       { key: 'AWS_SECRET_ACCESS_KEY', label: 'Secret Access Key', placeholder: '' },
       { key: 'AWS_REGION', label: 'Region', placeholder: 'us-east-1' },
+    ]},
+    bedrock_bearer: { label: 'AWS Bedrock (Bearer Token)', fields: [
+      { key: 'AWS_BEARER_TOKEN_BEDROCK', label: 'Bearer Token', placeholder: 'ABSK...', secret: true },
+      { key: 'AWS_REGION', label: 'Region', placeholder: 'us-east-1', secret: false },
     ]},
     openai: { label: 'OpenAI', fields: [{ key: 'OPENAI_API_KEY', label: 'API Key', placeholder: 'sk-...' }] },
     deepseek: { label: 'DeepSeek', fields: [{ key: 'DEEPSEEK_API_KEY', label: 'API Key', placeholder: '' }] },
@@ -25,7 +29,7 @@
   function handleSubmit(e) {
     e.preventDefault();
     const creds = { ...credentials };
-    if (provider === 'bedrock') {
+    if (provider === 'bedrock' || provider === 'bedrock_bearer') {
       creds['CLAUDE_CODE_USE_BEDROCK'] = '1';
     }
     onstart({
@@ -66,7 +70,7 @@
         <label class="field">
           <span class="field-label">{field.label}</span>
           <input
-            type="password"
+            type={field.secret !== false ? 'password' : 'text'}
             placeholder={field.placeholder}
             bind:value={credentials[field.key]}
             required

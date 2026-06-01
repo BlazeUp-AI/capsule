@@ -16,6 +16,12 @@ export default defineConfig({
       '/observal': {
         target: 'http://localhost:3001',
       },
+      '/assets': {
+        target: 'http://localhost:3001',
+      },
+      '/fonts': {
+        target: 'http://localhost:3001',
+      },
     },
   },
 });

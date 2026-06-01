@@ -28,7 +28,14 @@
     conn.on('connected', (msg) => {
       connState = 'ready';
       localSessionId = msg.session_id;
-      onconnected(msg.session_id, msg.observal_tokens || null);
+      // Write Observal tokens to sessionStorage for the iframe to pick up
+      if (msg.observal_token) {
+        sessionStorage.setItem('observal_access_token', msg.observal_token);
+      }
+      if (msg.observal_refresh_token) {
+        sessionStorage.setItem('observal_refresh_token', msg.observal_refresh_token);
+      }
+      onconnected(msg.session_id, null);
     });
 
     conn.on('reconnected', (msg) => {

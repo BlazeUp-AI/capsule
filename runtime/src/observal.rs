@@ -50,6 +50,7 @@ struct LoginResponse {
 
 pub struct ObservalClient {
     api_url: String,
+    container_api_url: String, // URL containers use to reach Observal (host.docker.internal)
     admin_email: String,
     admin_password: String,
     admin_token: Option<String>,
@@ -59,6 +60,9 @@ pub struct ObservalClient {
 impl ObservalClient {
     pub fn from_env() -> Option<Self> {
         let api_url = std::env::var("OBSERVAL_API_URL").ok()?;
+        // URL that containers use to reach Observal — on Docker Desktop, host.docker.internal
+        let container_api_url = std::env::var("OBSERVAL_CONTAINER_URL")
+            .unwrap_or_else(|_| api_url.replace("127.0.0.1", "host.docker.internal"));
         let admin_email =
             std::env::var("OBSERVAL_ADMIN_EMAIL").unwrap_or_else(|_| "admin@capsule.local".into());
         let admin_password = std::env::var("OBSERVAL_ADMIN_PASSWORD")
@@ -66,6 +70,7 @@ impl ObservalClient {
 
         Some(Self {
             api_url,
+            container_api_url,
             admin_email,
             admin_password,
             admin_token: None,
@@ -186,9 +191,14 @@ impl ObservalClient {
         }
     }
 
-    /// Get the API URL (for injecting into containers)
+    /// Get the API URL (for runtime-to-Observal communication)
     pub fn api_url(&self) -> &str {
         &self.api_url
+    }
+
+    /// Get the container-accessible API URL (for injecting into containers)
+    pub fn container_api_url(&self) -> &str {
+        &self.container_api_url
     }
 
     /// Get the admin token (for insights elevation proxy)

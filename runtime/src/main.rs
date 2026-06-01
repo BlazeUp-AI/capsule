@@ -149,7 +149,13 @@ async fn main() {
             put(api::write_file),
         )
         // Observal dashboard proxy
+        .route("/observal/{session_id}/", get(observal_proxy_root))
         .route("/observal/{session_id}/{*path}", get(observal_proxy))
+        // Observal API proxy (Web UI makes calls to /api/v1/*)
+        .route("/api/v1/{*path}", get(observal_api_proxy).post(observal_api_proxy))
+        // Observal static assets (referenced by the Web UI HTML with absolute paths)
+        .route("/assets/{*path}", get(observal_assets))
+        .route("/fonts/{*path}", get(observal_assets_fonts))
         .layer(cors)
         .with_state(state);
 
@@ -186,9 +192,27 @@ async fn export_workspace(
     }
 }
 
+async fn observal_proxy_root(
+    State((sessions, _, observal)): State<AppState>,
+    Path(session_id): Path<String>,
+    req: Request<Body>,
+) -> impl IntoResponse {
+    observal_proxy_handler(sessions, observal, session_id, String::new(), req).await
+}
+
 async fn observal_proxy(
     State((sessions, _, observal)): State<AppState>,
     Path((session_id, path)): Path<(String, String)>,
+    req: Request<Body>,
+) -> impl IntoResponse {
+    observal_proxy_handler(sessions, observal, session_id, path, req).await
+}
+
+async fn observal_proxy_handler(
+    sessions: Arc<SessionManager>,
+    observal: Arc<RwLock<Option<ObservalClient>>>,
+    session_id: String,
+    path: String,
     req: Request<Body>,
 ) -> impl IntoResponse {
     // Validate session exists
@@ -202,7 +226,13 @@ async fn observal_proxy(
     // Determine if this is an insights request needing elevation
     let is_insights = path.starts_with("api/v1/insights");
 
-    let target_url = format!("{}/{}", observal_web_url, path);
+    let is_html_page = path.is_empty() || path == "traces" || path == "agents" || path == "login";
+
+    let target_url = if path.is_empty() {
+        format!("{}/", observal_web_url)
+    } else {
+        format!("{}/{}", observal_web_url, path)
+    };
 
     let client = reqwest::Client::new();
     let mut proxy_req = client.request(req.method().clone(), &target_url);
@@ -243,6 +273,72 @@ async fn observal_proxy(
         Ok(resp) => {
             let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let headers = resp.headers().clone();
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+
+            // For HTML pages, inject a script to rewrite the URL so React Router sees "/"
+            let final_body = if is_html_page {
+                let html = String::from_utf8_lossy(&body_bytes);
+                let inject = format!(
+                    r#"<script>window.history.replaceState(null, "", "/");</script>"#
+                );
+                let modified = html.replacen("<head>", &format!("<head>{}", inject), 1);
+                modified.into_bytes()
+            } else {
+                body_bytes.to_vec()
+            };
+
+            let mut response = (status, final_body).into_response();
+            for (name, value) in headers.iter() {
+                if name == header::TRANSFER_ENCODING
+                    || name == header::CONNECTION
+                    || name == "content-security-policy"
+                    || name == "x-frame-options"
+                    || name == header::CONTENT_LENGTH
+                {
+                    continue;
+                }
+                response.headers_mut().insert(name.clone(), value.clone());
+            }
+            response
+        }
+        Err(e) => {
+            (StatusCode::BAD_GATEWAY, format!("Observal proxy error: {}", e)).into_response()
+        }
+    }
+}
+
+async fn observal_api_proxy(
+    Path(path): Path<String>,
+    req: Request<Body>,
+) -> axum::response::Response {
+    let observal_api_url =
+        std::env::var("OBSERVAL_API_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+    let target_url = format!("{}/api/v1/{}", observal_api_url, path);
+
+    let client = reqwest::Client::new();
+    let mut proxy_req = client.request(req.method().clone(), &target_url);
+
+    for (name, value) in req.headers() {
+        if name == header::HOST {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            proxy_req = proxy_req.header(name.as_str(), v);
+        }
+    }
+
+    let body_bytes = axum::body::to_bytes(req.into_body(), 10_485_760)
+        .await
+        .unwrap_or_default();
+    if !body_bytes.is_empty() {
+        proxy_req = proxy_req.body(body_bytes);
+    }
+
+    match proxy_req.send().await {
+        Ok(resp) => {
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let headers = resp.headers().clone();
             let body = resp.bytes().await.unwrap_or_default();
 
             let mut response = (status, body.to_vec()).into_response();
@@ -255,7 +351,41 @@ async fn observal_proxy(
             response
         }
         Err(e) => {
-            (StatusCode::BAD_GATEWAY, format!("Observal proxy error: {}", e)).into_response()
+            (StatusCode::BAD_GATEWAY, format!("Observal API proxy error: {}", e)).into_response()
         }
+    }
+}
+
+async fn observal_assets(Path(path): Path<String>) -> impl IntoResponse {
+    proxy_static_to_observal(format!("/assets/{}", path)).await
+}
+
+async fn observal_assets_fonts(Path(path): Path<String>) -> impl IntoResponse {
+    proxy_static_to_observal(format!("/fonts/{}", path)).await
+}
+
+async fn proxy_static_to_observal(path: String) -> axum::response::Response {
+    let observal_web_url =
+        std::env::var("OBSERVAL_WEB_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".into());
+    let target_url = format!("{}{}", observal_web_url, path);
+
+    let client = reqwest::Client::new();
+    match client.get(&target_url).send().await {
+        Ok(resp) => {
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let headers = resp.headers().clone();
+            let body = resp.bytes().await.unwrap_or_default();
+
+            let mut response = (status, body.to_vec()).into_response();
+            for (name, value) in headers.iter() {
+                if name == header::TRANSFER_ENCODING || name == header::CONNECTION {
+                    continue;
+                }
+                response.headers_mut().insert(name.clone(), value.clone());
+            }
+            response
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("Asset proxy error: {}", e)).into_response(),
     }
 }
