@@ -1,11 +1,13 @@
 //! Capsule Runtime - WebSocket handler
 
+use crate::docker::ContainerConfig;
 use crate::session::{Session, SessionError, SessionManager};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -18,6 +20,14 @@ pub enum ClientMessage {
     TerminalInput { data: String },
     Resize { cols: u16, rows: u16 },
     Ping,
+    #[serde(rename = "session_config")]
+    SessionConfig {
+        credentials: Option<HashMap<String, String>>,
+        agent: Option<String>,
+        image: Option<String>,
+        enable_dind: Option<bool>,
+        repo: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -25,6 +35,7 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     Connected { session_id: String },
     Reconnected { session_id: String },
+    SessionState { state: String, detail: String },
     Error { message: String },
     Pong,
 }
@@ -39,7 +50,7 @@ pub struct WsQuery {
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(query): Query<WsQuery>,
-    State(sessions): State<Arc<SessionManager>>,
+    State((sessions, _)): State<(Arc<SessionManager>, Option<String>)>,
 ) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_socket(socket, query.session_id, sessions))
 }
@@ -118,22 +129,24 @@ async fn resolve_reconnect(
     }
 }
 
-/// Wait for an initial resize, create a new session, and return it. Returns None on failure.
+/// Wait for initial resize + optional config, create a new session. Returns None on failure.
 async fn resolve_new_session(
     sessions: &Arc<SessionManager>,
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     ws_receiver: &mut futures::stream::SplitStream<WebSocket>,
 ) -> Option<(Arc<RwLock<Session>>, bool)> {
-    let (cols, rows) = match wait_for_initial_size(ws_receiver).await {
-        Some(size) => size,
+    let (cols, rows, config) = match wait_for_init_messages(ws_receiver).await {
+        Some(result) => result,
         None => {
-            warn!("Client disconnected before sending initial size");
+            warn!("Client disconnected before sending initial messages");
             return None;
         }
     };
-    info!(cols, rows, "Got initial terminal size");
+    info!(cols, rows, "Creating session");
 
-    match sessions.create_session(cols, rows).await {
+    send_state(ws_sender, "provisioning", "creating container").await;
+
+    match sessions.create_session(cols, rows, config).await {
         Ok(s) => Some((s, false)),
         Err(e) => {
             error!("Failed to create session: {}", e);
@@ -144,31 +157,120 @@ async fn resolve_new_session(
 }
 
 /// Send an error message over the WebSocket.
-async fn send_error(
+async fn send_error(ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>, message: &str) {
+    let msg = ServerMessage::Error {
+        message: message.into(),
+    };
+    let _ = ws_sender
+        .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
+        .await;
+}
+
+/// Send a session state update for progressive loading.
+async fn send_state(
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
-    message: &str,
+    state: &str,
+    detail: &str,
 ) {
-    let msg = ServerMessage::Error { message: message.into() };
-    let _ = ws_sender.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
+    let msg = ServerMessage::SessionState {
+        state: state.into(),
+        detail: detail.into(),
+    };
+    let _ = ws_sender
+        .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
+        .await;
 }
 
 
-async fn wait_for_initial_size(
+/// Wait for resize (required) and optional session_config messages.
+/// Returns (cols, rows, ContainerConfig). Times out to defaults after 5s.
+async fn wait_for_init_messages(
     ws_receiver: &mut futures::stream::SplitStream<WebSocket>,
-) -> Option<(u16, u16)> {
+) -> Option<(u16, u16, ContainerConfig)> {
     let timeout = tokio::time::Duration::from_secs(5);
+    let mut cols = 80u16;
+    let mut rows = 24u16;
+    let mut got_resize = false;
+    let mut config = ContainerConfig::default();
 
     loop {
         let msg = match tokio::time::timeout(timeout, ws_receiver.next()).await {
             Ok(Some(Ok(msg))) => msg,
             Ok(Some(Err(_))) | Ok(None) => return None,
-            Err(_) => return Some((80, 24)),
+            Err(_) => break, // timeout — use defaults
         };
 
         let Message::Text(text) = msg else { continue };
-        let Ok(ClientMessage::Resize { cols, rows }) = serde_json::from_str(&text) else { continue };
-        return Some((cols, rows));
+        let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) else {
+            continue;
+        };
+
+        match client_msg {
+            ClientMessage::Resize { cols: c, rows: r } => {
+                cols = c;
+                rows = r;
+                got_resize = true;
+                // If we already have resize but no config after 500ms, proceed
+                if got_resize {
+                    // Give a short window for config to arrive
+                    let brief = tokio::time::Duration::from_millis(500);
+                    match tokio::time::timeout(brief, ws_receiver.next()).await {
+                        Ok(Some(Ok(Message::Text(t)))) => {
+                            if let Ok(ClientMessage::SessionConfig {
+                                credentials,
+                                agent,
+                                image,
+                                enable_dind,
+                                repo,
+                            }) = serde_json::from_str(&t)
+                            {
+                                let mut env_vars = credentials.unwrap_or_default();
+                                if let Some(a) = agent {
+                                    env_vars.insert("CAPSULE_AGENT".to_string(), a);
+                                }
+                                if let Some(r) = repo {
+                                    env_vars.insert("CAPSULE_REPO".to_string(), r);
+                                }
+                                config = ContainerConfig {
+                                    image,
+                                    env_vars,
+                                    enable_dind: enable_dind.unwrap_or(false),
+                                };
+                            }
+                        }
+                        _ => {} // No config — use defaults
+                    }
+                    break;
+                }
+            }
+            ClientMessage::SessionConfig {
+                credentials,
+                agent,
+                image,
+                enable_dind,
+                repo,
+            } => {
+                let mut env_vars = credentials.unwrap_or_default();
+                if let Some(a) = agent {
+                    env_vars.insert("CAPSULE_AGENT".to_string(), a);
+                }
+                if let Some(r) = repo {
+                    env_vars.insert("CAPSULE_REPO".to_string(), r);
+                }
+                config = ContainerConfig {
+                    image,
+                    env_vars,
+                    enable_dind: enable_dind.unwrap_or(false),
+                };
+                if got_resize {
+                    break;
+                }
+            }
+            _ => continue,
+        }
     }
+
+    Some((cols, rows, config))
 }
 
 /// Run session and return the output receiver when done (for reconnect support)
@@ -243,13 +345,14 @@ async fn handle_ws_message(msg: Message, session: &Arc<RwLock<Session>>) -> bool
 async fn handle_client_message(msg: ClientMessage, session: &Arc<RwLock<Session>>) -> bool {
     match msg {
         ClientMessage::TerminalInput { data } => {
+            session.write().await.touch_pty();
             session.read().await.write(data.as_bytes()).await.is_ok()
         }
         ClientMessage::Resize { cols, rows } => {
-            info!(cols, rows, "Resize");
             let _ = session.read().await.resize(cols, rows).await;
             true
         }
         ClientMessage::Ping => true,
+        ClientMessage::SessionConfig { .. } => true, // ignored after init
     }
 }

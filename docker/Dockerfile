@@ -25,6 +25,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     inotify-tools \
     && rm -rf /var/lib/apt/lists/*
 
+# ── Node.js 22 (required for Claude Code) ──────────────────────────────────────
+
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Claude Code CLI ─────────────────────────────────────────────────────────────
+
+RUN npm install -g @anthropic-ai/claude-code
+
+# ── Observal CLI ────────────────────────────────────────────────────────────────
+
+RUN pip3 install --break-system-packages observal-cli
+
 # ── Install fastfetch ───────────────────────────────────────────────────────────
 
 RUN ARCH=$(uname -m) \
@@ -55,7 +69,9 @@ RUN mkdir -p /workspace && chown developer:developer /workspace
 USER developer
 WORKDIR /workspace
 
-# Run fastfetch on login
-RUN echo 'fastfetch' >> ~/.bashrc
+# ── Shell configuration ─────────────────────────────────────────────────────────
+
+RUN echo 'fastfetch' >> ~/.bashrc \
+    && echo '[ -n "$OBSERVAL_TOKEN" ] && observal doctor patch --all --all-ides >/dev/null 2>&1 || true' >> ~/.bashrc
 
 CMD ["/bin/bash"]
