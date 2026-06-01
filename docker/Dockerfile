@@ -19,11 +19,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     less \
     locales \
     vim \
+    python3 \
+    python3-pip \
+    python3-venv \
+    inotify-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Install fastfetch ───────────────────────────────────────────────────────────
 
-RUN curl -sL https://github.com/fastfetch-cli/fastfetch/releases/latest/download/fastfetch-linux-amd64.deb -o /tmp/fastfetch.deb \
+RUN ARCH=$(uname -m) \
+    && curl -sL "https://github.com/fastfetch-cli/fastfetch/releases/latest/download/fastfetch-linux-${ARCH}.deb" -o /tmp/fastfetch.deb \
     && dpkg -i /tmp/fastfetch.deb \
     && rm /tmp/fastfetch.deb
 
