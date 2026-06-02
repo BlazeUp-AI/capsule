@@ -20,6 +20,10 @@ type AppState = (Arc<SessionManager>, Option<String>, Arc<RwLock<Option<Observal
 
 #[tokio::main]
 async fn main() {
+    // Load .env from project root (sibling to runtime/)
+    let _ = dotenvy::from_filename("../.env")
+        .or_else(|_| dotenvy::dotenv());
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()

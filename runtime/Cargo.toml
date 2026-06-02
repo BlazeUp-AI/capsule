@@ -27,6 +27,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # HTTP client (Observal API)
 reqwest = { version = "0.12", features = ["json"] }
 
+# Env
+dotenvy = "0.15"
+
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
