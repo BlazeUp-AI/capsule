@@ -8,7 +8,7 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
-use capsule_runtime::{api, observal::ObservalClient, session::SessionManager, websocket::ws_handler};
+use capsule_runtime::{api, free_keys::FreeKeyPool, observal::ObservalClient, session::SessionManager, websocket::ws_handler};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -16,7 +16,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-type AppState = (Arc<SessionManager>, Option<String>, Arc<RwLock<Option<ObservalClient>>>);
+type AppState = (Arc<SessionManager>, Option<String>, Arc<RwLock<Option<ObservalClient>>>, Arc<FreeKeyPool>);
 
 #[tokio::main]
 async fn main() {
@@ -121,7 +121,12 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let state: AppState = (Arc::clone(&sessions), api_token, Arc::clone(&observal));
+    let free_keys = Arc::new(FreeKeyPool::from_env());
+    if free_keys.is_empty() {
+        info!("Free-tier key pool empty (set CAPSULE_FREE_KEYS_GEMINI, CAPSULE_FREE_KEYS_GROQ, CAPSULE_FREE_KEYS_OPENROUTER)");
+    }
+
+    let state: AppState = (Arc::clone(&sessions), api_token, Arc::clone(&observal), free_keys);
 
     let app = Router::new()
         // WebSocket (uses SessionManager directly)
@@ -176,7 +181,7 @@ async fn health_check() -> &'static str {
 }
 
 async fn export_workspace(
-    State((sessions, _, _)): State<AppState>,
+    State((sessions, _, _, _)): State<AppState>,
     Path(session_id): Path<String>,
 ) -> impl IntoResponse {
     match sessions.export_workspace(&session_id).await {
@@ -197,7 +202,7 @@ async fn export_workspace(
 }
 
 async fn observal_proxy_root(
-    State((sessions, _, observal)): State<AppState>,
+    State((sessions, _, observal, _)): State<AppState>,
     Path(session_id): Path<String>,
     req: Request<Body>,
 ) -> impl IntoResponse {
@@ -205,7 +210,7 @@ async fn observal_proxy_root(
 }
 
 async fn observal_proxy(
-    State((sessions, _, observal)): State<AppState>,
+    State((sessions, _, observal, _)): State<AppState>,
     Path((session_id, path)): Path<(String, String)>,
     req: Request<Body>,
 ) -> impl IntoResponse {

@@ -2,6 +2,7 @@
   let { onstart } = $props();
 
   const PROVIDERS = {
+    free: { label: 'Free Tier (No Key Required)', fields: [] },
     anthropic: { label: 'Anthropic', fields: [{ key: 'ANTHROPIC_API_KEY', label: 'API Key', placeholder: 'sk-ant-...' }] },
     bedrock: { label: 'AWS Bedrock (IAM Keys)', fields: [
       { key: 'AWS_ACCESS_KEY_ID', label: 'Access Key ID', placeholder: 'AKIA...' },
@@ -22,7 +23,7 @@
     ]},
   };
 
-  let provider = $state('anthropic');
+  let provider = $state('free');
   let credentials = $state({});
   let repo = $state('');
   let observalKey = $state('');
@@ -36,10 +37,13 @@
     if (observalKey.trim()) {
       creds['OBSERVAL_LICENSE_KEY'] = observalKey.trim();
     }
+
+    const agent = provider === 'free' ? undefined : 'claude';
+
     onstart({
       provider,
-      credentials: creds,
-      agent: 'claude',
+      credentials: Object.keys(creds).length > 0 ? creds : undefined,
+      agent,
       repo: repo || undefined,
     });
   }
@@ -71,17 +75,23 @@
         </select>
       </label>
 
-      {#each PROVIDERS[provider].fields as field}
-        <label class="field">
-          <span class="field-label">{field.label}</span>
-          <input
-            type={field.secret !== false ? 'password' : 'text'}
-            placeholder={field.placeholder}
-            bind:value={credentials[field.key]}
-            required
-          />
-        </label>
-      {/each}
+      {#if provider === 'free'}
+        <div class="free-tier-note">
+          Uses Gemini / Groq / OpenRouter with opencode. No API key needed.
+        </div>
+      {:else}
+        {#each PROVIDERS[provider].fields as field}
+          <label class="field">
+            <span class="field-label">{field.label}</span>
+            <input
+              type={field.secret !== false ? 'password' : 'text'}
+              placeholder={field.placeholder}
+              bind:value={credentials[field.key]}
+              required
+            />
+          </label>
+        {/each}
+      {/if}
 
       <label class="field">
         <span class="field-label">Repository (optional)</span>
@@ -160,6 +170,16 @@
     color: var(--text-lo);
     opacity: 0.6;
     margin-top: 2px;
+  }
+
+  .free-tier-note {
+    font-size: 10px;
+    color: var(--text-lo);
+    background: var(--bg-inset);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    line-height: 1.5;
   }
 
   input, select {

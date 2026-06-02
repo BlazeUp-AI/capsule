@@ -57,9 +57,9 @@ pub struct WsQuery {
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(query): Query<WsQuery>,
-    State((sessions, _, observal)): State<(Arc<SessionManager>, Option<String>, Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>)>,
+    State((sessions, _, observal, free_keys)): State<(Arc<SessionManager>, Option<String>, Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>, Arc<crate::free_keys::FreeKeyPool>)>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, query.session_id, sessions, observal))
+    ws.on_upgrade(|socket| handle_socket(socket, query.session_id, sessions, observal, free_keys))
 }
 
 async fn handle_socket(
@@ -67,6 +67,7 @@ async fn handle_socket(
     session_id: Option<String>,
     sessions: Arc<SessionManager>,
     observal: Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>,
+    free_keys: Arc<crate::free_keys::FreeKeyPool>,
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
@@ -75,7 +76,7 @@ async fn handle_socket(
             Some(s) => (s.0, s.1, None, None),
             None => return,
         },
-        None => match resolve_new_session(&sessions, &mut ws_sender, &mut ws_receiver, &observal).await {
+        None => match resolve_new_session(&sessions, &mut ws_sender, &mut ws_receiver, &observal, &free_keys).await {
             Some(s) => (s.0, s.1, s.2, s.3),
             None => return,
         },
@@ -147,6 +148,7 @@ async fn resolve_new_session(
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     ws_receiver: &mut futures::stream::SplitStream<WebSocket>,
     observal: &Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>,
+    free_keys: &Arc<crate::free_keys::FreeKeyPool>,
 ) -> Option<(Arc<RwLock<Session>>, bool, Option<String>, Option<String>)> {
     let (cols, rows, mut config) = match wait_for_init_messages(ws_receiver).await {
         Some(result) => result,
@@ -158,6 +160,20 @@ async fn resolve_new_session(
     info!(cols, rows, "Creating session");
 
     send_state(ws_sender, "provisioning", "creating container").await;
+
+    // If no provider API key was sent, assign a free-tier key
+    let has_user_key = config.env_vars.keys().any(|k| {
+        k.ends_with("_API_KEY") || k.ends_with("_ACCESS_KEY_ID") || k == "AWS_BEARER_TOKEN_BEDROCK"
+    });
+
+    if !has_user_key {
+        if let Some(provider_key) = free_keys.next_key() {
+            info!(provider = provider_key.provider, "Assigning free-tier key");
+            config.env_vars.insert(provider_key.env_var.to_string(), provider_key.key.clone());
+            config.env_vars.insert("CAPSULE_AGENT".to_string(), "opencode".to_string());
+            config.env_vars.insert("CAPSULE_FREE_TIER".to_string(), "1".to_string());
+        }
+    }
 
     // Provision Observal user — non-blocking, skip if unavailable
     let session_id_preview = Uuid::new_v4().to_string();
