@@ -46,11 +46,18 @@ async fn main() {
         info!("API token authentication disabled (CAPSULE_API_TOKEN not set)");
     }
 
+    // Free-tier key pool (must be created before Observal init to configure insights)
+    let free_keys = Arc::new(FreeKeyPool::from_env());
+    if free_keys.is_empty() {
+        info!("Free-tier key pool empty (set CAPSULE_FREE_KEYS_GEMINI, CAPSULE_FREE_KEYS_GROQ, CAPSULE_FREE_KEYS_OPENROUTER)");
+    }
+
     // Initialize Observal client (optional — runs without it)
     let observal: Arc<RwLock<Option<ObservalClient>>> = Arc::new(RwLock::new(None));
     if let Some(mut client) = ObservalClient::from_env() {
         info!("Observal integration enabled ({})", client.api_url());
         let observal_clone = Arc::clone(&observal);
+        let free_keys_for_observal = Arc::clone(&free_keys);
         tokio::spawn(async move {
             // Wait for Observal to be ready (it boots slower than us)
             for attempt in 1..=30 {
@@ -66,6 +73,7 @@ async fn main() {
             match client.authenticate_admin().await {
                 Ok(()) => {
                     info!("Observal admin authenticated, integration active");
+                    client.configure_insights(&free_keys_for_observal).await;
                     *observal_clone.write().await = Some(client);
                 }
                 Err(e) => {
@@ -120,11 +128,6 @@ async fn main() {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
-
-    let free_keys = Arc::new(FreeKeyPool::from_env());
-    if free_keys.is_empty() {
-        info!("Free-tier key pool empty (set CAPSULE_FREE_KEYS_GEMINI, CAPSULE_FREE_KEYS_GROQ, CAPSULE_FREE_KEYS_OPENROUTER)");
-    }
 
     let state: AppState = (Arc::clone(&sessions), api_token, Arc::clone(&observal), free_keys);
 

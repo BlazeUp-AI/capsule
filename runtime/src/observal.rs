@@ -205,4 +205,49 @@ impl ObservalClient {
     pub fn admin_token_value(&self) -> Option<&str> {
         self.admin_token.as_deref()
     }
+
+    /// Configure insights model and API key so report generation works.
+    /// Uses the first available free key (Gemini preferred for generous limits).
+    pub async fn configure_insights(&self, free_pool: &crate::free_keys::FreeKeyPool) {
+        let token = match self.admin_token() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        // Pick the best key for insights (Gemini first)
+        let (model, api_key) = if let Some(pk) = free_pool.next_key() {
+            let model = match pk.provider {
+                "gemini" => "gemini/gemini-2.5-flash",
+                "groq" => "groq/llama-3.3-70b-versatile",
+                "openrouter" => "openrouter/google/gemini-2.5-flash",
+                _ => "gemini/gemini-2.5-flash",
+            };
+            (model, pk.key.clone())
+        } else {
+            return;
+        };
+
+        let settings = [
+            ("insights.model_sections", model),
+            ("insights.model_synthesis", model),
+        ];
+
+        for (key, value) in settings {
+            let _ = self.http
+                .put(format!("{}/api/v1/admin/settings/{}", self.api_url, key))
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "value": value }))
+                .send()
+                .await;
+        }
+
+        let _ = self.http
+            .put(format!("{}/api/v1/admin/settings/insights.api_key", self.api_url))
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "value": api_key }))
+            .send()
+            .await;
+
+        info!(model, "Observal insights configured");
+    }
 }
