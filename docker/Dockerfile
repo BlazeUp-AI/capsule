@@ -31,9 +31,17 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Claude Code CLI ─────────────────────────────────────────────────────────────
+# ── AI Coding CLIs ─────────────────────────────────────────────────────────────
 
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code opencode-ai
+
+RUN curl -fsSL https://cli.kiro.dev/install | bash \
+    && cp -f /root/.local/bin/kiro* /usr/local/bin/ 2>/dev/null || true \
+    && cp -f /root/.local/bin/q /usr/local/bin/ 2>/dev/null || true \
+    && ln -sf /usr/local/bin/kiro-cli /usr/local/bin/kiro
+
+RUN curl -fsSL https://pi.dev/install.sh | sh \
+    && cp -f /root/.local/bin/pi /usr/local/bin/ 2>/dev/null || true
 
 # ── Observal CLI ────────────────────────────────────────────────────────────────
 
