@@ -42,9 +42,9 @@ RUN pip3 install --break-system-packages observal-cli
 # ── Install fastfetch ───────────────────────────────────────────────────────────
 
 RUN ARCH=$(uname -m) \
-    && curl -sL "https://github.com/fastfetch-cli/fastfetch/releases/latest/download/fastfetch-linux-${ARCH}.deb" -o /tmp/fastfetch.deb \
-    && dpkg -i /tmp/fastfetch.deb \
-    && rm /tmp/fastfetch.deb
+    && curl -sL "https://github.com/fastfetch-cli/fastfetch/releases/download/2.40.3/fastfetch-linux-${ARCH}.deb" -o /tmp/fastfetch.deb \
+    && dpkg -i /tmp/fastfetch.deb || true \
+    && rm -f /tmp/fastfetch.deb
 
 # ── Locale configuration ────────────────────────────────────────────────────────
 

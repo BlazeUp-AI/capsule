@@ -156,10 +156,14 @@ async fn main() {
         // Observal static assets (referenced by the Web UI HTML with absolute paths)
         .route("/assets/{*path}", get(observal_assets))
         .route("/fonts/{*path}", get(observal_assets_fonts))
+        .route("/observal-logo.svg", get(observal_root_asset))
+        .route("/favicon.ico", get(observal_root_asset_favicon))
         .layer(cors)
         .with_state(state);
 
-    let bind_addr = "0.0.0.0:3001";
+    let bind_addr = std::env::var("CAPSULE_BIND")
+        .unwrap_or_else(|_| "0.0.0.0:3001".into());
+    let bind_addr = bind_addr.as_str();
     let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
     info!("Runtime listening on http://{}", bind_addr);
     info!("WebSocket endpoint: ws://{}/ws", bind_addr);
@@ -275,12 +279,28 @@ async fn observal_proxy_handler(
             let headers = resp.headers().clone();
             let body_bytes = resp.bytes().await.unwrap_or_default();
 
-            // For HTML pages, inject a script to rewrite the URL so React Router sees "/"
+            // For HTML pages, inject scripts to:
+            // 1. Rewrite URL so React Router sees "/"
+            // 2. Copy auth tokens from parent window (same origin) into iframe storage
+            // 3. Decode JWT to extract role and set user metadata in localStorage
             let final_body = if is_html_page {
                 let html = String::from_utf8_lossy(&body_bytes);
-                let inject = format!(
-                    r#"<script>window.history.replaceState(null, "", "/");</script>"#
-                );
+                let inject = r#"<script>
+window.history.replaceState(null, "", "/");
+try {
+  var t = window.parent.sessionStorage.getItem("observal_access_token");
+  var r = window.parent.sessionStorage.getItem("observal_refresh_token");
+  if (t) {
+    sessionStorage.setItem("observal_access_token", t);
+    try {
+      var p = JSON.parse(atob(t.split(".")[1]));
+      if (p.role) localStorage.setItem("observal_user_role", p.role);
+      if (p.sub) localStorage.setItem("observal_user_email", p.sub);
+    } catch(e2) {}
+  }
+  if (r) localStorage.setItem("observal_refresh_token", r);
+} catch(e) {}
+</script>"#;
                 let modified = html.replacen("<head>", &format!("<head>{}", inject), 1);
                 modified.into_bytes()
             } else {
@@ -362,6 +382,14 @@ async fn observal_assets(Path(path): Path<String>) -> impl IntoResponse {
 
 async fn observal_assets_fonts(Path(path): Path<String>) -> impl IntoResponse {
     proxy_static_to_observal(format!("/fonts/{}", path)).await
+}
+
+async fn observal_root_asset() -> impl IntoResponse {
+    proxy_static_to_observal("/observal-logo.svg".to_string()).await
+}
+
+async fn observal_root_asset_favicon() -> impl IntoResponse {
+    proxy_static_to_observal("/favicon.ico".to_string()).await
 }
 
 async fn proxy_static_to_observal(path: String) -> axum::response::Response {

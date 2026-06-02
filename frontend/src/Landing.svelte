@@ -25,12 +25,16 @@
   let provider = $state('anthropic');
   let credentials = $state({});
   let repo = $state('');
+  let observalKey = $state('');
 
   function handleSubmit(e) {
     e.preventDefault();
     const creds = { ...credentials };
     if (provider === 'bedrock' || provider === 'bedrock_bearer') {
       creds['CLAUDE_CODE_USE_BEDROCK'] = '1';
+    }
+    if (observalKey.trim()) {
+      creds['OBSERVAL_LICENSE_KEY'] = observalKey.trim();
     }
     onstart({
       provider,
@@ -41,6 +45,7 @@
   }
 
   $effect(() => {
+    provider;
     credentials = {};
   });
 </script>
@@ -81,6 +86,18 @@
       <label class="field">
         <span class="field-label">Repository (optional)</span>
         <input type="text" placeholder="https://github.com/..." bind:value={repo} />
+      </label>
+
+      <div class="section-divider"></div>
+
+      <label class="field">
+        <span class="field-label">Observal License Key (optional)</span>
+        <input
+          type="password"
+          placeholder="eyJ..."
+          bind:value={observalKey}
+        />
+        <span class="field-hint">Enables enterprise telemetry, tracing & insights</span>
       </label>
 
       <button type="submit" class="btn-start">Start Session</button>
@@ -138,6 +155,13 @@
     color: var(--text-lo);
   }
 
+  .field-hint {
+    font-size: 9px;
+    color: var(--text-lo);
+    opacity: 0.6;
+    margin-top: 2px;
+  }
+
   input, select {
     background: var(--bg-inset);
     border: 1px solid var(--border);
@@ -151,6 +175,11 @@
 
   input:focus, select:focus {
     border-color: var(--accent);
+  }
+
+  .section-divider {
+    border-top: 1px solid var(--border);
+    margin: 4px 0;
   }
 
   .btn-start {

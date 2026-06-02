@@ -120,7 +120,7 @@ impl ObservalClient {
             .json(&CreateUserRequest {
                 email: email.clone(),
                 name: format!("Session {}", &session_id[..8]),
-                role: "admin".to_string(),
+                role: "super_admin".to_string(),
             })
             .send()
             .await?;
