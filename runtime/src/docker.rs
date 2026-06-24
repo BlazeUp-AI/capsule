@@ -83,6 +83,8 @@ impl ContainerManager {
         let network_mode =
             std::env::var("CAPSULE_CONTAINER_NETWORK").unwrap_or_else(|_| "bridge".to_string());
 
+        // Passwordless sudo in the image relies on setuid elevation, so these
+        // session containers must not opt into Docker's no-new-privileges mode.
         let host_config = bollard::service::HostConfig {
             memory: Some(4 * 1024 * 1024 * 1024), // 4GB
             nano_cpus: Some(2_000_000_000),       // 2 CPUs
@@ -90,7 +92,6 @@ impl ContainerManager {
             network_mode: Some(network_mode),
             extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
             binds: if binds.is_empty() { None } else { Some(binds) },
-            security_opt: Some(vec!["no-new-privileges".to_string()]),
             ..Default::default()
         };
 
