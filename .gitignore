@@ -3,6 +3,7 @@
 
 # Node
 node_modules/
+frontend/dist/
 
 # Logs
 *.log
@@ -21,3 +22,9 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+/Observal
+
+PLAN-MVP.md
+PLAN-SCALING.md
+PLANS.md

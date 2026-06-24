@@ -45,6 +45,21 @@ bash / Claude Code
 - Rust 1.75+
 - Node.js 18+
 - Docker (daemon running)
+- `CAPSULE_FREE_KEYS_OPENROUTER` or `OPENROUTER_API_KEY` in `.env`
+
+### One-command dev run
+
+```bash
+./dev.sh
+```
+
+Open **http://localhost:3002** in your browser. Press `Ctrl-C` in the script terminal to stop the runtime, stop the frontend server, and remove session containers created during that run.
+
+The browser opens straight into a Claude Code terminal. Type `claude` to start Claude Code; Observal traces are available from the Traces tab for the same session.
+
+Claude Code is routed through OpenRouter when `CAPSULE_FREE_KEYS_OPENROUTER` is configured. Override the default model with `CAPSULE_OPENROUTER_MODEL` if needed; the built-in default is `qwen/qwen3-coder:free`.
+
+If local Observal URLs are configured in `.env`, the helper also starts `docker-compose.observal.yml` before the runtime. Set `CAPSULE_OBSERVAL=0` to skip that stack, or `CAPSULE_OBSERVAL_STOP=1` to stop it when the helper exits.
 
 ### Build the container image
 
@@ -65,7 +80,8 @@ cargo run --release
 
 ```bash
 cd frontend
-node server.js
+npm install
+npm run dev -- --host 0.0.0.0 --port 3002
 # Serving at http://localhost:3002
 ```
 
@@ -77,6 +93,7 @@ Open **http://localhost:3002** in your browser.
 
 ```
 capsule/
+├── dev.sh                # One-command local dev runner
 ├── runtime/              # Rust backend
 │   └── src/
 │       ├── main.rs       # Axum server, routes, cleanup task
@@ -85,10 +102,9 @@ capsule/
 │       ├── docker.rs     # Container lifecycle via bollard
 │       └── pty.rs        # PTY spawning + I/O threads
 ├── frontend/
-│   ├── index.html        # Full terminal UI (xterm.js)
-│   ├── test.html         # Minimal test terminal
-│   ├── server.js         # Static dev server (port 3002)
-│   └── lib/              # xterm.js bundle + CSS
+│   ├── index.html        # Vite entrypoint
+│   ├── package.json      # Svelte/Vite frontend scripts
+│   └── src/              # Workspace UI, editor, terminal, traces
 └── docker/
     └── Dockerfile        # Container image (Debian + bash + dev tools)
 ```

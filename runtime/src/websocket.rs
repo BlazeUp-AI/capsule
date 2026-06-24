@@ -1,31 +1,61 @@
 //! Capsule Runtime - WebSocket handler
 
+use crate::docker::ContainerConfig;
 use crate::session::{Session, SessionError, SessionManager};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 // ── Message types ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    TerminalInput { data: String },
-    Resize { cols: u16, rows: u16 },
+    TerminalInput {
+        data: String,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     Ping,
+    #[serde(rename = "session_config")]
+    SessionConfig {
+        credentials: Option<HashMap<String, String>>,
+        agent: Option<String>,
+        image: Option<String>,
+        enable_dind: Option<bool>,
+        repo: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    Connected { session_id: String },
-    Reconnected { session_id: String },
-    Error { message: String },
+    Connected {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        observal_token: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        observal_refresh_token: Option<String>,
+    },
+    Reconnected {
+        session_id: String,
+    },
+    SessionState {
+        state: String,
+        detail: String,
+    },
+    Error {
+        message: String,
+    },
     Pong,
 }
 
@@ -39,25 +69,40 @@ pub struct WsQuery {
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(query): Query<WsQuery>,
-    State(sessions): State<Arc<SessionManager>>,
+    State((sessions, _, observal, free_keys)): State<(
+        Arc<SessionManager>,
+        Option<String>,
+        Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>,
+        Arc<crate::free_keys::FreeKeyPool>,
+    )>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, query.session_id, sessions))
+    ws.on_upgrade(|socket| handle_socket(socket, query.session_id, sessions, observal, free_keys))
 }
 
 async fn handle_socket(
     socket: WebSocket,
     session_id: Option<String>,
     sessions: Arc<SessionManager>,
+    observal: Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>,
+    free_keys: Arc<crate::free_keys::FreeKeyPool>,
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    let (session, is_reconnect) = match session_id {
+    let (session, is_reconnect, obs_token, obs_refresh) = match session_id {
         Some(id) => match resolve_reconnect(&id, &sessions, &mut ws_sender).await {
-            Some(s) => s,
+            Some(s) => (s.0, s.1, None, None),
             None => return,
         },
-        None => match resolve_new_session(&sessions, &mut ws_sender, &mut ws_receiver).await {
-            Some(s) => s,
+        None => match resolve_new_session(
+            &sessions,
+            &mut ws_sender,
+            &mut ws_receiver,
+            &observal,
+            &free_keys,
+        )
+        .await
+        {
+            Some(s) => (s.0, s.1, s.2, s.3),
             None => return,
         },
     };
@@ -67,14 +112,22 @@ async fn handle_socket(
     // Send connected/reconnected confirmation
     let confirm_msg = if is_reconnect {
         info!(session_id = %session_id, "Client reconnected");
-        ServerMessage::Reconnected { session_id: session_id.clone() }
+        ServerMessage::Reconnected {
+            session_id: session_id.clone(),
+        }
     } else {
         info!(session_id = %session_id, "Session created");
-        ServerMessage::Connected { session_id: session_id.clone() }
+        ServerMessage::Connected {
+            session_id: session_id.clone(),
+            observal_token: obs_token,
+            observal_refresh_token: obs_refresh,
+        }
     };
 
     if ws_sender
-        .send(Message::Text(serde_json::to_string(&confirm_msg).unwrap().into()))
+        .send(Message::Text(
+            serde_json::to_string(&confirm_msg).unwrap().into(),
+        ))
         .await
         .is_err()
     {
@@ -118,23 +171,73 @@ async fn resolve_reconnect(
     }
 }
 
-/// Wait for an initial resize, create a new session, and return it. Returns None on failure.
+/// Wait for initial resize + optional config, create a new session. Returns None on failure.
 async fn resolve_new_session(
     sessions: &Arc<SessionManager>,
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     ws_receiver: &mut futures::stream::SplitStream<WebSocket>,
-) -> Option<(Arc<RwLock<Session>>, bool)> {
-    let (cols, rows) = match wait_for_initial_size(ws_receiver).await {
-        Some(size) => size,
+    observal: &Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>,
+    free_keys: &Arc<crate::free_keys::FreeKeyPool>,
+) -> Option<(Arc<RwLock<Session>>, bool, Option<String>, Option<String>)> {
+    let (cols, rows, mut config) = match wait_for_init_messages(ws_receiver).await {
+        Some(result) => result,
         None => {
-            warn!("Client disconnected before sending initial size");
+            warn!("Client disconnected before sending initial messages");
             return None;
         }
     };
-    info!(cols, rows, "Got initial terminal size");
+    info!(cols, rows, "Creating session");
 
-    match sessions.create_session(cols, rows).await {
-        Ok(s) => Some((s, false)),
+    send_state(ws_sender, "provisioning", "creating container").await;
+
+    if let Err(message) = configure_claude_env(&mut config, free_keys) {
+        warn!(error = message, "Claude Code session rejected");
+        send_error(ws_sender, message).await;
+        return None;
+    }
+
+    // Provision Observal user — non-blocking, skip if unavailable
+    let session_id_preview = Uuid::new_v4().to_string();
+    let mut observal_access_token: Option<String> = None;
+    let mut observal_refresh_token: Option<String> = None;
+
+    send_state(ws_sender, "provisioning", "configuring Observal traces").await;
+    wait_for_observal(observal, tokio::time::Duration::from_secs(10)).await;
+
+    let observal_guard = observal.read().await;
+    if let Some(client) = observal_guard.as_ref() {
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(3),
+            client.provision_session_user(&session_id_preview),
+        )
+        .await
+        {
+            Ok(Ok(tokens)) => {
+                config
+                    .env_vars
+                    .insert("OBSERVAL_TOKEN".to_string(), tokens.access_token.clone());
+                config.env_vars.insert(
+                    "OBSERVAL_SERVER_URL".to_string(),
+                    client.container_api_url().to_string(),
+                );
+                observal_access_token = Some(tokens.access_token);
+                observal_refresh_token = Some(tokens.refresh_token);
+                info!("Observal user provisioned for session");
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "Failed to provision Observal user, continuing without telemetry");
+            }
+            Err(_) => {
+                warn!("Observal provisioning timed out, continuing without telemetry");
+            }
+        }
+    }
+    drop(observal_guard);
+
+    send_state(ws_sender, "provisioning", "starting Claude terminal").await;
+
+    match sessions.create_session(cols, rows, config).await {
+        Ok(s) => Some((s, false, observal_access_token, observal_refresh_token)),
         Err(e) => {
             error!("Failed to create session: {}", e);
             send_error(ws_sender, &e.to_string()).await;
@@ -143,32 +246,294 @@ async fn resolve_new_session(
     }
 }
 
-/// Send an error message over the WebSocket.
-async fn send_error(
-    ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
-    message: &str,
-) {
-    let msg = ServerMessage::Error { message: message.into() };
-    let _ = ws_sender.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
+fn configure_claude_env(
+    config: &mut ContainerConfig,
+    free_keys: &crate::free_keys::FreeKeyPool,
+) -> Result<(), &'static str> {
+    config
+        .env_vars
+        .insert("CAPSULE_AGENT".to_string(), "claude".to_string());
+
+    if has_claude_credentials(&config.env_vars) {
+        return Ok(());
+    }
+
+    if let Some(key) = configured_anthropic_key() {
+        config.env_vars.insert("ANTHROPIC_API_KEY".to_string(), key);
+        return Ok(());
+    }
+
+    if let Some(provider_key) = free_keys.next_key() {
+        match provider_key.provider {
+            "anthropic" => {
+                config
+                    .env_vars
+                    .insert("ANTHROPIC_API_KEY".to_string(), provider_key.key.clone());
+                return Ok(());
+            }
+            "openrouter" => {
+                configure_openrouter_claude_env(config, &provider_key.key);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    Err(
+        "Claude Code is not configured. Set CAPSULE_FREE_KEYS_OPENROUTER, OPENROUTER_API_KEY, ANTHROPIC_API_KEY, or CAPSULE_ANTHROPIC_API_KEY in .env, then restart the runtime.",
+    )
 }
 
+fn configure_openrouter_claude_env(config: &mut ContainerConfig, key: &str) {
+    config
+        .env_vars
+        .insert("OPENROUTER_API_KEY".to_string(), key.to_string());
+    config.env_vars.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        std::env::var("CAPSULE_OPENROUTER_ANTHROPIC_BASE_URL")
+            .unwrap_or_else(|_| "https://openrouter.ai/api".to_string()),
+    );
+    config
+        .env_vars
+        .insert("ANTHROPIC_API_KEY".to_string(), String::new());
+    config
+        .env_vars
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.to_string());
 
-async fn wait_for_initial_size(
+    let opus_model = std::env::var("CAPSULE_OPENROUTER_OPUS_MODEL")
+        .or_else(|_| std::env::var("CAPSULE_CLAUDE_CODE_MODEL"))
+        .or_else(|_| std::env::var("CAPSULE_OPENROUTER_MODEL"))
+        .unwrap_or_else(|_| "~anthropic/claude-opus-latest".to_string());
+    let sonnet_model = std::env::var("CAPSULE_OPENROUTER_SONNET_MODEL")
+        .or_else(|_| std::env::var("CAPSULE_CLAUDE_CODE_MODEL"))
+        .or_else(|_| std::env::var("CAPSULE_OPENROUTER_MODEL"))
+        .unwrap_or_else(|_| "~anthropic/claude-sonnet-latest".to_string());
+    let haiku_model = std::env::var("CAPSULE_OPENROUTER_HAIKU_MODEL")
+        .or_else(|_| std::env::var("CAPSULE_CLAUDE_CODE_SMALL_MODEL"))
+        .or_else(|_| std::env::var("CAPSULE_OPENROUTER_SMALL_MODEL"))
+        .unwrap_or_else(|_| "~anthropic/claude-haiku-latest".to_string());
+
+    config
+        .env_vars
+        .insert("ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(), opus_model);
+    config
+        .env_vars
+        .insert("ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(), sonnet_model);
+    config.env_vars.insert(
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
+        haiku_model.clone(),
+    );
+    config
+        .env_vars
+        .insert("CLAUDE_CODE_SUBAGENT_MODEL".to_string(), haiku_model);
+}
+
+fn has_claude_credentials(env_vars: &HashMap<String, String>) -> bool {
+    if env_vars
+        .get("ANTHROPIC_API_KEY")
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return true;
+    }
+
+    if env_vars
+        .get("ANTHROPIC_AUTH_TOKEN")
+        .is_some_and(|value| !value.trim().is_empty())
+        && env_vars
+            .get("ANTHROPIC_BASE_URL")
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return true;
+    }
+
+    let bedrock_enabled = env_vars
+        .get("CLAUDE_CODE_USE_BEDROCK")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    if !bedrock_enabled {
+        return false;
+    }
+
+    env_vars
+        .get("AWS_BEARER_TOKEN_BEDROCK")
+        .is_some_and(|value| !value.trim().is_empty())
+        || (env_vars
+            .get("AWS_ACCESS_KEY_ID")
+            .is_some_and(|value| !value.trim().is_empty())
+            && env_vars
+                .get("AWS_SECRET_ACCESS_KEY")
+                .is_some_and(|value| !value.trim().is_empty()))
+}
+
+fn configured_anthropic_key() -> Option<String> {
+    for name in ["ANTHROPIC_API_KEY", "CAPSULE_ANTHROPIC_API_KEY"] {
+        if let Ok(value) = std::env::var(name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    let value = std::env::var("CAPSULE_ANTHROPIC_API_KEYS")
+        .or_else(|_| std::env::var("CAPSULE_FREE_KEYS_ANTHROPIC"))
+        .ok()?;
+    value
+        .split(',')
+        .map(str::trim)
+        .find(|key| !key.is_empty())
+        .map(ToString::to_string)
+}
+
+async fn wait_for_observal(
+    observal: &Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>,
+    timeout: tokio::time::Duration,
+) {
+    if std::env::var("OBSERVAL_API_URL")
+        .ok()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return;
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    while tokio::time::Instant::now() < deadline {
+        if observal.read().await.is_some() {
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// Send an error message over the WebSocket.
+async fn send_error(ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>, message: &str) {
+    let msg = ServerMessage::Error {
+        message: message.into(),
+    };
+    let _ = ws_sender
+        .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
+        .await;
+}
+
+/// Send a session state update for progressive loading.
+async fn send_state(
+    ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    state: &str,
+    detail: &str,
+) {
+    let msg = ServerMessage::SessionState {
+        state: state.into(),
+        detail: detail.into(),
+    };
+    let _ = ws_sender
+        .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
+        .await;
+}
+
+/// Wait for resize (required) and optional session_config messages.
+/// Returns (cols, rows, ContainerConfig). Times out to defaults after 5s.
+async fn wait_for_init_messages(
     ws_receiver: &mut futures::stream::SplitStream<WebSocket>,
-) -> Option<(u16, u16)> {
+) -> Option<(u16, u16, ContainerConfig)> {
     let timeout = tokio::time::Duration::from_secs(5);
+    let mut cols = 80u16;
+    let mut rows = 24u16;
+    let mut got_resize = false;
+    let mut got_config = false;
+    let mut config = ContainerConfig::default();
 
     loop {
         let msg = match tokio::time::timeout(timeout, ws_receiver.next()).await {
             Ok(Some(Ok(msg))) => msg,
             Ok(Some(Err(_))) | Ok(None) => return None,
-            Err(_) => return Some((80, 24)),
+            Err(_) => break, // timeout — use whatever we have
         };
 
         let Message::Text(text) = msg else { continue };
-        let Ok(ClientMessage::Resize { cols, rows }) = serde_json::from_str(&text) else { continue };
-        return Some((cols, rows));
+        let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) else {
+            continue;
+        };
+
+        match client_msg {
+            ClientMessage::Resize { cols: c, rows: r } => {
+                cols = c;
+                rows = r;
+                got_resize = true;
+            }
+            ClientMessage::SessionConfig {
+                credentials,
+                agent,
+                image,
+                enable_dind,
+                repo,
+            } => {
+                let mut env_vars = credentials.unwrap_or_default();
+                if let Some(a) = agent {
+                    env_vars.insert("CAPSULE_AGENT".to_string(), a);
+                }
+                if let Some(r) = repo {
+                    env_vars.insert("CAPSULE_REPO".to_string(), r);
+                }
+                config = ContainerConfig {
+                    image,
+                    env_vars,
+                    enable_dind: enable_dind.unwrap_or(false),
+                };
+                got_config = true;
+            }
+            _ => continue,
+        }
+
+        // Once we have both (or resize + timeout for config), proceed
+        if got_resize && got_config {
+            break;
+        }
+
+        // If we have resize but not config, give a brief window
+        if got_resize && !got_config {
+            let brief = tokio::time::Duration::from_millis(1000);
+            let deadline = tokio::time::Instant::now() + brief;
+            while tokio::time::Instant::now() < deadline {
+                match tokio::time::timeout_at(deadline, ws_receiver.next()).await {
+                    Ok(Some(Ok(Message::Text(t)))) => {
+                        if let Ok(ClientMessage::SessionConfig {
+                            credentials,
+                            agent,
+                            image,
+                            enable_dind,
+                            repo,
+                        }) = serde_json::from_str(&t)
+                        {
+                            let mut env_vars = credentials.unwrap_or_default();
+                            if let Some(a) = agent {
+                                env_vars.insert("CAPSULE_AGENT".to_string(), a);
+                            }
+                            if let Some(r) = repo {
+                                env_vars.insert("CAPSULE_REPO".to_string(), r);
+                            }
+                            config = ContainerConfig {
+                                image,
+                                env_vars,
+                                enable_dind: enable_dind.unwrap_or(false),
+                            };
+                            got_config = true;
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            break;
+        }
     }
+
+    info!(
+        got_resize,
+        got_config,
+        env_count = config.env_vars.len(),
+        "Init messages received"
+    );
+    Some((cols, rows, config))
 }
 
 /// Run session and return the output receiver when done (for reconnect support)
@@ -224,7 +589,7 @@ async fn run_session(
 async fn handle_ws_message(msg: Message, session: &Arc<RwLock<Session>>) -> bool {
     // Update activity timestamp
     session.write().await.touch();
-    
+
     match msg {
         Message::Text(text) => {
             let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) else {
@@ -232,9 +597,7 @@ async fn handle_ws_message(msg: Message, session: &Arc<RwLock<Session>>) -> bool
             };
             handle_client_message(client_msg, session).await
         }
-        Message::Binary(data) => {
-            session.read().await.write(&data).await.is_ok()
-        }
+        Message::Binary(data) => session.read().await.write(&data).await.is_ok(),
         Message::Close(_) => false,
         _ => true,
     }
@@ -243,13 +606,14 @@ async fn handle_ws_message(msg: Message, session: &Arc<RwLock<Session>>) -> bool
 async fn handle_client_message(msg: ClientMessage, session: &Arc<RwLock<Session>>) -> bool {
     match msg {
         ClientMessage::TerminalInput { data } => {
+            session.write().await.touch_pty();
             session.read().await.write(data.as_bytes()).await.is_ok()
         }
         ClientMessage::Resize { cols, rows } => {
-            info!(cols, rows, "Resize");
             let _ = session.read().await.resize(cols, rows).await;
             true
         }
         ClientMessage::Ping => true,
+        ClientMessage::SessionConfig { .. } => true, // ignored after init
     }
 }

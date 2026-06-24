@@ -49,11 +49,25 @@ pub fn spawn_docker_pty(
     cols: u16,
     rows: u16,
 ) -> Result<(mpsc::Sender<PtyCommand>, mpsc::Receiver<Vec<u8>>), PtyError> {
+    spawn_docker_pty_with_env(container_id, cols, rows, &[])
+}
+
+/// Spawn a PTY that executes into a Docker container with extra env vars
+pub fn spawn_docker_pty_with_env(
+    container_id: String,
+    cols: u16,
+    rows: u16,
+    env_vars: &[(String, String)],
+) -> Result<(mpsc::Sender<PtyCommand>, mpsc::Receiver<Vec<u8>>), PtyError> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<PtyCommand>(64);
     let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>(256);
 
+    let env_owned: Vec<(String, String)> = env_vars.to_vec();
+
     std::thread::spawn(move || {
-        if let Err(e) = run_docker_pty_thread(&container_id, cols, rows, cmd_rx, output_tx) {
+        if let Err(e) =
+            run_docker_pty_thread(&container_id, cols, rows, &env_owned, cmd_rx, output_tx)
+        {
             error!("Docker PTY thread error: {}", e);
         }
     });
@@ -83,19 +97,25 @@ fn run_docker_pty_thread(
     container_id: &str,
     cols: u16,
     rows: u16,
+    extra_env: &[(String, String)],
     cmd_rx: mpsc::Receiver<PtyCommand>,
     output_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(), PtyError> {
     let mut cmd = CommandBuilder::new("docker");
-    cmd.args([
-        "exec",
-        "-it",
-        "-e", "TERM=xterm-256color",
-        "-e", "LANG=C.UTF-8",
-        "-w", "/workspace",
-        container_id,
-        "/bin/bash",
-    ]);
+    let mut args: Vec<&str> = vec!["exec", "-it", "-e", "TERM=xterm-256color", "-e", "LANG=C.UTF-8"];
+
+    let env_strings: Vec<String> = extra_env
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+
+    for env_str in &env_strings {
+        args.push("-e");
+        args.push(env_str);
+    }
+
+    args.extend_from_slice(&["-w", "/workspace", container_id, "/bin/bash"]);
+    cmd.args(args);
 
     run_pty_thread(cols, rows, cmd, cmd_rx, output_tx)
 }
