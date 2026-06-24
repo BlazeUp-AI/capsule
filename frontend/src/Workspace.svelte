@@ -31,9 +31,11 @@
       // Write Observal tokens to sessionStorage for the iframe to pick up
       if (msg.observal_token) {
         sessionStorage.setItem('observal_access_token', msg.observal_token);
+        localStorage.setItem('observal_access_token', msg.observal_token);
       }
       if (msg.observal_refresh_token) {
         sessionStorage.setItem('observal_refresh_token', msg.observal_refresh_token);
+        localStorage.setItem('observal_refresh_token', msg.observal_refresh_token);
       }
       onconnected(msg.session_id, null);
     });
@@ -90,7 +92,7 @@
         Editor
       </button>
       <button class="tab" class:active={activeTab === 'traces'} onclick={() => switchTab('traces')}>
-        Traces
+        Sessions
       </button>
     </div>
 

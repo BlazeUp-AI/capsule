@@ -44,8 +44,8 @@ services:
       - JWT_KEY_DIR=/data/keys
       - SKIP_DDL_ON_STARTUP=true
       - SEED_DEMO_ACCOUNTS=true
-      - DEMO_SUPER_ADMIN_EMAIL=capsule-admin@localhost
-      - DEMO_SUPER_ADMIN_PASSWORD=capsule-admin-secret
+      - DEMO_SUPER_ADMIN_EMAIL=${OBSERVAL_ADMIN_EMAIL:-admin@capsule.local}
+      - DEMO_SUPER_ADMIN_PASSWORD=${OBSERVAL_ADMIN_PASSWORD:-capsule-admin-changeme}
     volumes:
       - apidata:/data
     depends_on:

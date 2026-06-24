@@ -14,7 +14,7 @@
   {#if loaded && sessionId}
     <iframe
       bind:this={iframeEl}
-      src="/observal/{sessionId}/"
+      src="/observal/{sessionId}/sessions"
       title="Observal Dashboard"
       class="traces-iframe"
     ></iframe>

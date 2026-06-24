@@ -2,12 +2,21 @@
   import Landing from './Landing.svelte';
   import Workspace from './Workspace.svelte';
 
-  let sessionState = $state('landing'); // 'landing' | 'connecting' | 'active'
-  let sessionConfig = $state(null);
+  const serverConfig = { provider: 'server', agent: 'claude' };
+  const shouldAutoStart = localStorage.getItem('capsule:autoStartServer') === '1';
+
+  let sessionState = $state(shouldAutoStart ? 'connecting' : 'landing'); // 'landing' | 'connecting' | 'active'
+  let sessionConfig = $state(shouldAutoStart ? serverConfig : null);
   let sessionId = $state(null);
   let observalTokens = $state(null);
 
   function handleStart(config) {
+    if (config.autoStartServer) {
+      localStorage.setItem('capsule:autoStartServer', '1');
+    } else {
+      localStorage.removeItem('capsule:autoStartServer');
+    }
+
     sessionConfig = config;
     sessionState = 'connecting';
   }
@@ -22,7 +31,7 @@
     sessionState = 'landing';
     sessionId = null;
     observalTokens = null;
-    sessionConfig = null;
+    sessionConfig = serverConfig;
   }
 </script>
 

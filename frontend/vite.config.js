@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 
+const runtimeTarget = process.env.CAPSULE_RUNTIME_TARGET || 'http://localhost:3001';
+
 export default defineConfig({
   plugins: [svelte()],
   optimizeDeps: {
@@ -10,23 +12,23 @@ export default defineConfig({
     port: 3002,
     proxy: {
       '/ws': {
-        target: 'http://localhost:3005',
+        target: runtimeTarget,
         ws: true,
       },
       '/api': {
-        target: 'http://localhost:3005',
+        target: runtimeTarget,
       },
       '/observal': {
-        target: 'http://localhost:3005',
+        target: runtimeTarget,
       },
       '/assets': {
-        target: 'http://localhost:3005',
+        target: runtimeTarget,
       },
       '/fonts': {
-        target: 'http://localhost:3005',
+        target: runtimeTarget,
       },
       '/observal-logo.svg': {
-        target: 'http://localhost:3005',
+        target: runtimeTarget,
       },
     },
   },

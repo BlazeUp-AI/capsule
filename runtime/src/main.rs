@@ -1,14 +1,17 @@
 //! Capsule Runtime Server
 
 use axum::{
+    Router,
     body::Body,
     extract::{Path, Request, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::IntoResponse,
     routing::{delete, get, post, put},
-    Router,
 };
-use capsule_runtime::{api, free_keys::FreeKeyPool, observal::ObservalClient, session::SessionManager, websocket::ws_handler};
+use capsule_runtime::{
+    api, free_keys::FreeKeyPool, observal::ObservalClient, session::SessionManager,
+    websocket::ws_handler,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -16,13 +19,17 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-type AppState = (Arc<SessionManager>, Option<String>, Arc<RwLock<Option<ObservalClient>>>, Arc<FreeKeyPool>);
+type AppState = (
+    Arc<SessionManager>,
+    Option<String>,
+    Arc<RwLock<Option<ObservalClient>>>,
+    Arc<FreeKeyPool>,
+);
 
 #[tokio::main]
 async fn main() {
     // Load .env from project root (sibling to runtime/)
-    let _ = dotenvy::from_filename("../.env")
-        .or_else(|_| dotenvy::dotenv());
+    let _ = dotenvy::from_filename("../.env").or_else(|_| dotenvy::dotenv());
 
     tracing_subscriber::registry()
         .with(
@@ -50,10 +57,12 @@ async fn main() {
         info!("API token authentication disabled (CAPSULE_API_TOKEN not set)");
     }
 
-    // Free-tier key pool (must be created before Observal init to configure insights)
+    // Provider key pool (must be created before Observal init to configure insights)
     let free_keys = Arc::new(FreeKeyPool::from_env());
     if free_keys.is_empty() {
-        info!("Free-tier key pool empty (set CAPSULE_FREE_KEYS_GEMINI, CAPSULE_FREE_KEYS_GROQ, CAPSULE_FREE_KEYS_OPENROUTER)");
+        info!(
+            "Provider key pool empty (set CAPSULE_FREE_KEYS_OPENROUTER, OPENROUTER_API_KEY, ANTHROPIC_API_KEY, or CAPSULE_ANTHROPIC_API_KEY)"
+        );
     }
 
     // Initialize Observal client (optional — runs without it)
@@ -69,7 +78,9 @@ async fn main() {
                     break;
                 }
                 if attempt == 30 {
-                    tracing::warn!("Observal not reachable after 30 attempts, continuing without it");
+                    tracing::warn!(
+                        "Observal not reachable after 30 attempts, continuing without it"
+                    );
                     return;
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -133,7 +144,12 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let state: AppState = (Arc::clone(&sessions), api_token, Arc::clone(&observal), free_keys);
+    let state: AppState = (
+        Arc::clone(&sessions),
+        api_token,
+        Arc::clone(&observal),
+        free_keys,
+    );
 
     let app = Router::new()
         // WebSocket (uses SessionManager directly)
@@ -164,7 +180,10 @@ async fn main() {
         .route("/observal/{session_id}/", get(observal_proxy_root))
         .route("/observal/{session_id}/{*path}", get(observal_proxy))
         // Observal API proxy (Web UI makes calls to /api/v1/*)
-        .route("/api/v1/{*path}", get(observal_api_proxy).post(observal_api_proxy))
+        .route(
+            "/api/v1/{*path}",
+            get(observal_api_proxy).post(observal_api_proxy),
+        )
         // Observal static assets (referenced by the Web UI HTML with absolute paths)
         .route("/assets/{*path}", get(observal_assets))
         .route("/fonts/{*path}", get(observal_assets_fonts))
@@ -173,8 +192,7 @@ async fn main() {
         .layer(cors)
         .with_state(state);
 
-    let bind_addr = std::env::var("CAPSULE_BIND")
-        .unwrap_or_else(|_| "0.0.0.0:3001".into());
+    let bind_addr = std::env::var("CAPSULE_BIND").unwrap_or_else(|_| "0.0.0.0:3001".into());
     let bind_addr = bind_addr.as_str();
     let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
     info!("Runtime listening on http://{}", bind_addr);
@@ -242,7 +260,11 @@ async fn observal_proxy_handler(
     // Determine if this is an insights request needing elevation
     let is_insights = path.starts_with("api/v1/insights");
 
-    let is_html_page = path.is_empty() || path == "traces" || path == "agents" || path == "login";
+    let is_html_page = path.is_empty()
+        || path == "traces"
+        || path == "sessions"
+        || path == "agents"
+        || path == "login";
 
     let target_url = if path.is_empty() {
         format!("{}/", observal_web_url)
@@ -287,7 +309,8 @@ async fn observal_proxy_handler(
 
     match proxy_req.send().await {
         Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let headers = resp.headers().clone();
             let body_bytes = resp.bytes().await.unwrap_or_default();
 
@@ -304,13 +327,17 @@ try {
   var r = window.parent.sessionStorage.getItem("observal_refresh_token");
   if (t) {
     sessionStorage.setItem("observal_access_token", t);
+    localStorage.setItem("observal_access_token", t);
     try {
       var p = JSON.parse(atob(t.split(".")[1]));
       if (p.role) localStorage.setItem("observal_user_role", p.role);
       if (p.sub) localStorage.setItem("observal_user_email", p.sub);
     } catch(e2) {}
   }
-  if (r) localStorage.setItem("observal_refresh_token", r);
+  if (r) {
+    sessionStorage.setItem("observal_refresh_token", r);
+    localStorage.setItem("observal_refresh_token", r);
+  }
 } catch(e) {}
 </script>"#;
                 let modified = html.replacen("<head>", &format!("<head>{}", inject), 1);
@@ -333,9 +360,11 @@ try {
             }
             response
         }
-        Err(e) => {
-            (StatusCode::BAD_GATEWAY, format!("Observal proxy error: {}", e)).into_response()
-        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("Observal proxy error: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -382,9 +411,11 @@ async fn observal_api_proxy(
             }
             response
         }
-        Err(e) => {
-            (StatusCode::BAD_GATEWAY, format!("Observal API proxy error: {}", e)).into_response()
-        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("Observal API proxy error: {}", e),
+        )
+            .into_response(),
     }
 }
 

@@ -3,7 +3,7 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Error, Debug)]
 pub enum ObservalError {
@@ -59,7 +59,9 @@ pub struct ObservalClient {
 
 impl ObservalClient {
     pub fn from_env() -> Option<Self> {
-        let api_url = std::env::var("OBSERVAL_API_URL").ok()?;
+        let api_url = std::env::var("OBSERVAL_API_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())?;
         // URL that containers use to reach Observal — on Docker Desktop, host.docker.internal
         let container_api_url = std::env::var("OBSERVAL_CONTAINER_URL")
             .unwrap_or_else(|_| api_url.replace("127.0.0.1", "host.docker.internal"));
@@ -184,10 +186,7 @@ impl ObservalClient {
 
         match resp {
             Ok(r) => r.status().is_success(),
-            Err(e) => {
-                warn!(error = %e, "Observal health check failed");
-                false
-            }
+            Err(_) => false,
         }
     }
 
@@ -207,20 +206,18 @@ impl ObservalClient {
     }
 
     /// Configure insights model and API key so report generation works.
-    /// Uses the first available free key (Gemini preferred for generous limits).
+    /// Uses the same provider key pool as Claude Code sessions.
     pub async fn configure_insights(&self, free_pool: &crate::free_keys::FreeKeyPool) {
         let token = match self.admin_token() {
             Ok(t) => t,
             Err(_) => return,
         };
 
-        // Pick the best key for insights (Gemini first)
         let (model, api_key) = if let Some(pk) = free_pool.next_key() {
             let model = match pk.provider {
-                "gemini" => "gemini/gemini-2.5-flash",
-                "groq" => "groq/llama-3.3-70b-versatile",
-                "openrouter" => "openrouter/google/gemini-2.5-flash",
-                _ => "gemini/gemini-2.5-flash",
+                "anthropic" => "anthropic/claude-sonnet-4-20250514",
+                "openrouter" => "openrouter/qwen/qwen3-coder:free",
+                _ => "anthropic/claude-sonnet-4-20250514",
             };
             (model, pk.key.clone())
         } else {
@@ -233,7 +230,8 @@ impl ObservalClient {
         ];
 
         for (key, value) in settings {
-            let _ = self.http
+            let _ = self
+                .http
                 .put(format!("{}/api/v1/admin/settings/{}", self.api_url, key))
                 .bearer_auth(token)
                 .json(&serde_json::json!({ "value": value }))
@@ -241,8 +239,12 @@ impl ObservalClient {
                 .await;
         }
 
-        let _ = self.http
-            .put(format!("{}/api/v1/admin/settings/insights.api_key", self.api_url))
+        let _ = self
+            .http
+            .put(format!(
+                "{}/api/v1/admin/settings/insights.api_key",
+                self.api_url
+            ))
             .bearer_auth(token)
             .json(&serde_json::json!({ "value": api_key }))
             .send()

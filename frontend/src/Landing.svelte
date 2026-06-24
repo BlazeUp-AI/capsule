@@ -2,55 +2,97 @@
   let { onstart } = $props();
 
   const PROVIDERS = {
-    free: { label: 'Free Tier (No Key Required)', fields: [] },
-    anthropic: { label: 'Anthropic', fields: [{ key: 'ANTHROPIC_API_KEY', label: 'API Key', placeholder: 'sk-ant-...' }] },
-    bedrock: { label: 'AWS Bedrock (IAM Keys)', fields: [
-      { key: 'AWS_ACCESS_KEY_ID', label: 'Access Key ID', placeholder: 'AKIA...' },
-      { key: 'AWS_SECRET_ACCESS_KEY', label: 'Secret Access Key', placeholder: '' },
-      { key: 'AWS_REGION', label: 'Region', placeholder: 'us-east-1' },
-    ]},
-    bedrock_bearer: { label: 'AWS Bedrock (Bearer Token)', fields: [
-      { key: 'AWS_BEARER_TOKEN_BEDROCK', label: 'Bearer Token', placeholder: 'ABSK...', secret: true },
-      { key: 'AWS_REGION', label: 'Region', placeholder: 'us-east-1', secret: false },
-    ]},
-    openai: { label: 'OpenAI', fields: [{ key: 'OPENAI_API_KEY', label: 'API Key', placeholder: 'sk-...' }] },
-    deepseek: { label: 'DeepSeek', fields: [{ key: 'DEEPSEEK_API_KEY', label: 'API Key', placeholder: '' }] },
-    gemini: { label: 'Google Gemini', fields: [{ key: 'GOOGLE_API_KEY', label: 'API Key', placeholder: '' }] },
-    azure: { label: 'Azure OpenAI', fields: [
-      { key: 'AZURE_OPENAI_API_KEY', label: 'API Key', placeholder: '' },
-      { key: 'AZURE_OPENAI_ENDPOINT', label: 'Endpoint URL', placeholder: 'https://...' },
-      { key: 'AZURE_OPENAI_DEPLOYMENT_NAME', label: 'Deployment Name', placeholder: '' },
-    ]},
+    server: {
+      label: 'Server Settings',
+      note: 'Uses the runtime environment. Good for the shared OpenRouter or Anthropic configuration.',
+      fields: [],
+    },
+    anthropic_key: {
+      label: 'Anthropic Key',
+      note: 'Uses a one-session Anthropic key.',
+      fields: [{ key: 'ANTHROPIC_API_KEY', label: 'Anthropic API Key', placeholder: 'sk-ant-...' }],
+    },
+    deepseek_key: {
+      label: 'DeepSeek Key',
+      note: 'Uses DeepSeek Anthropic compatibility for this session only.',
+      fields: [{ key: 'DEEPSEEK_API_KEY', label: 'DeepSeek API Key', placeholder: 'sk-...' }],
+    },
+    openrouter_key: {
+      label: 'OpenRouter Key',
+      note: 'Uses OpenRouter Anthropic Skin. Claude Code is most reliable with Anthropic models here.',
+      fields: [
+        { key: 'OPENROUTER_API_KEY', label: 'OpenRouter API Key', placeholder: 'sk-or-...' },
+        { key: 'OPENROUTER_MODEL', label: 'Model', placeholder: '~anthropic/claude-sonnet-latest', secret: false, required: false },
+      ],
+    },
   };
 
-  let provider = $state('free');
+  let provider = $state('server');
   let credentials = $state({});
   let repo = $state('');
   let observalKey = $state('');
+  let autoStartServer = $state(localStorage.getItem('capsule:autoStartServer') === '1');
+
+  function buildCredentials() {
+    const key = (credentials[`${provider === 'deepseek_key' ? 'DEEPSEEK' : provider === 'openrouter_key' ? 'OPENROUTER' : 'ANTHROPIC'}_API_KEY`] || '').trim();
+
+    if (provider === 'server') {
+      return {};
+    }
+
+    if (provider === 'anthropic_key') {
+      return { ANTHROPIC_API_KEY: key };
+    }
+
+    if (provider === 'deepseek_key') {
+      return {
+        ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic',
+        ANTHROPIC_AUTH_TOKEN: key,
+        ANTHROPIC_API_KEY: '',
+        ANTHROPIC_MODEL: 'deepseek-v4-pro[1m]',
+        ANTHROPIC_DEFAULT_OPUS_MODEL: 'deepseek-v4-pro[1m]',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'deepseek-v4-pro[1m]',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'deepseek-v4-flash',
+        CLAUDE_CODE_SUBAGENT_MODEL: 'deepseek-v4-flash',
+        CLAUDE_CODE_EFFORT_LEVEL: 'max',
+      };
+    }
+
+    const model = (credentials.OPENROUTER_MODEL || '').trim() || '~anthropic/claude-sonnet-latest';
+    return {
+      OPENROUTER_API_KEY: key,
+      ANTHROPIC_BASE_URL: 'https://openrouter.ai/api',
+      ANTHROPIC_AUTH_TOKEN: key,
+      ANTHROPIC_API_KEY: '',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: model,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: model,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
+      CLAUDE_CODE_SUBAGENT_MODEL: model,
+    };
+  }
 
   function handleSubmit(e) {
     e.preventDefault();
-    const creds = { ...credentials };
-    if (provider === 'bedrock' || provider === 'bedrock_bearer') {
-      creds['CLAUDE_CODE_USE_BEDROCK'] = '1';
-    }
+    const creds = buildCredentials();
     if (observalKey.trim()) {
       creds['OBSERVAL_LICENSE_KEY'] = observalKey.trim();
     }
 
-    const agent = provider === 'free' ? undefined : 'claude';
-
     onstart({
       provider,
       credentials: Object.keys(creds).length > 0 ? creds : undefined,
-      agent,
+      agent: 'claude',
       repo: repo || undefined,
+      autoStartServer: provider === 'server' && autoStartServer,
     });
   }
 
   $effect(() => {
     provider;
     credentials = {};
+    if (provider !== 'server') {
+      autoStartServer = false;
+    }
   });
 </script>
 
@@ -75,22 +117,27 @@
         </select>
       </label>
 
-      {#if provider === 'free'}
-        <div class="free-tier-note">
-          Uses Gemini / Groq / OpenRouter with opencode. No API key needed.
-        </div>
-      {:else}
-        {#each PROVIDERS[provider].fields as field}
-          <label class="field">
-            <span class="field-label">{field.label}</span>
-            <input
-              type={field.secret !== false ? 'password' : 'text'}
-              placeholder={field.placeholder}
-              bind:value={credentials[field.key]}
-              required
-            />
-          </label>
-        {/each}
+      <div class="provider-note">
+        {PROVIDERS[provider].note}
+      </div>
+
+      {#each PROVIDERS[provider].fields as field}
+        <label class="field">
+          <span class="field-label">{field.label}</span>
+          <input
+            type={field.secret !== false ? 'password' : 'text'}
+            placeholder={field.placeholder}
+            bind:value={credentials[field.key]}
+            required={field.required !== false}
+          />
+        </label>
+      {/each}
+
+      {#if provider === 'server'}
+        <label class="check-field">
+          <input type="checkbox" bind:checked={autoStartServer} />
+          <span>Open terminal immediately next time</span>
+        </label>
       {/if}
 
       <label class="field">
@@ -158,6 +205,15 @@
     gap: 4px;
   }
 
+  .check-field {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-lo);
+    font-size: 10px;
+    line-height: 1.4;
+  }
+
   .field-label {
     font-size: 10px;
     text-transform: uppercase;
@@ -172,7 +228,7 @@
     margin-top: 2px;
   }
 
-  .free-tier-note {
+  .provider-note {
     font-size: 10px;
     color: var(--text-lo);
     background: var(--bg-inset);
@@ -195,6 +251,12 @@
 
   input:focus, select:focus {
     border-color: var(--accent);
+  }
+
+  input[type='checkbox'] {
+    width: 13px;
+    height: 13px;
+    accent-color: var(--accent);
   }
 
   .section-divider {

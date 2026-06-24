@@ -1,11 +1,11 @@
 //! Capsule Runtime - Docker container management
 
+use bollard::Docker;
 use bollard::container::{
     Config, CreateContainerOptions, DownloadFromContainerOptions, RemoveContainerOptions,
     StartContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::Docker;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -80,11 +80,15 @@ impl ContainerManager {
             binds.push("/var/run/docker.sock:/var/run/docker.sock".to_string());
         }
 
+        let network_mode =
+            std::env::var("CAPSULE_CONTAINER_NETWORK").unwrap_or_else(|_| "bridge".to_string());
+
         let host_config = bollard::service::HostConfig {
             memory: Some(4 * 1024 * 1024 * 1024), // 4GB
-            nano_cpus: Some(2_000_000_000),        // 2 CPUs
+            nano_cpus: Some(2_000_000_000),       // 2 CPUs
             pids_limit: Some(256),
-            network_mode: Some("bridge".to_string()),
+            network_mode: Some(network_mode),
+            extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
             binds: if binds.is_empty() { None } else { Some(binds) },
             security_opt: Some(vec!["no-new-privileges".to_string()]),
             ..Default::default()
@@ -196,9 +200,7 @@ impl ContainerManager {
 
     /// Download workspace directory as tar archive
     pub async fn export_workspace(&self, container_id: &str) -> Result<Vec<u8>, DockerError> {
-        let options = DownloadFromContainerOptions {
-            path: "/workspace",
-        };
+        let options = DownloadFromContainerOptions { path: "/workspace" };
 
         let mut stream = self
             .docker

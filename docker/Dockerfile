@@ -31,28 +31,13 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# ── AI Coding CLIs ─────────────────────────────────────────────────────────────
+# ── Claude Code ────────────────────────────────────────────────────────────────
 
-RUN npm install -g @anthropic-ai/claude-code opencode-ai
-
-RUN curl -fsSL https://cli.kiro.dev/install | bash \
-    && cp -f /root/.local/bin/kiro* /usr/local/bin/ 2>/dev/null || true \
-    && cp -f /root/.local/bin/q /usr/local/bin/ 2>/dev/null || true \
-    && ln -sf /usr/local/bin/kiro-cli /usr/local/bin/kiro
-
-RUN curl -fsSL https://pi.dev/install.sh | sh \
-    && cp -f /root/.local/bin/pi /usr/local/bin/ 2>/dev/null || true
+RUN npm install -g @anthropic-ai/claude-code
 
 # ── Observal CLI ────────────────────────────────────────────────────────────────
 
 RUN pip3 install --break-system-packages observal-cli
-
-# ── Install fastfetch ───────────────────────────────────────────────────────────
-
-RUN ARCH=$(uname -m) \
-    && curl -sL "https://github.com/fastfetch-cli/fastfetch/releases/download/2.40.3/fastfetch-linux-${ARCH}.deb" -o /tmp/fastfetch.deb \
-    && dpkg -i /tmp/fastfetch.deb || true \
-    && rm -f /tmp/fastfetch.deb
 
 # ── Locale configuration ────────────────────────────────────────────────────────
 
@@ -63,6 +48,7 @@ RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 ENV TERM=xterm-256color
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
+ENV CAPSULE_AGENT=claude
 
 # ── User setup ──────────────────────────────────────────────────────────────────
 
@@ -79,7 +65,21 @@ WORKDIR /workspace
 
 # ── Shell configuration ─────────────────────────────────────────────────────────
 
-RUN echo 'fastfetch' >> ~/.bashrc \
-    && echo '[ -n "$OBSERVAL_TOKEN" ] && mkdir -p ~/.observal && printf "{\"server_url\":\"%s\",\"access_token\":\"%s\"}" "$OBSERVAL_SERVER_URL" "$OBSERVAL_TOKEN" > ~/.observal/config.json && observal doctor patch --all --all-ides >/dev/null 2>&1 || true' >> ~/.bashrc
+USER root
 
+RUN printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set +e' \
+    'if [ -z "${OBSERVAL_TOKEN:-}" ] || [ -z "${OBSERVAL_SERVER_URL:-}" ]; then' \
+    '    return 0 2>/dev/null || exit 0' \
+    'fi' \
+    'mkdir -p "$HOME/.observal"' \
+    'printf "{\"server_url\":\"%s\",\"access_token\":\"%s\"}" "$OBSERVAL_SERVER_URL" "$OBSERVAL_TOKEN" > "$HOME/.observal/config.json"' \
+    'observal doctor --yes patch --all --harness claude-code >/dev/null 2>&1 || true' \
+    > /usr/local/bin/capsule-observal-setup \
+    && chmod 0755 /usr/local/bin/capsule-observal-setup \
+    && echo 'capsule-observal-setup >/dev/null 2>&1 || true' >> /home/developer/.bashrc \
+    && chown developer:developer /home/developer/.bashrc
+
+USER developer
 CMD ["/bin/bash"]

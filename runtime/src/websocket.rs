@@ -18,8 +18,13 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    TerminalInput { data: String },
-    Resize { cols: u16, rows: u16 },
+    TerminalInput {
+        data: String,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     Ping,
     #[serde(rename = "session_config")]
     SessionConfig {
@@ -41,9 +46,16 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         observal_refresh_token: Option<String>,
     },
-    Reconnected { session_id: String },
-    SessionState { state: String, detail: String },
-    Error { message: String },
+    Reconnected {
+        session_id: String,
+    },
+    SessionState {
+        state: String,
+        detail: String,
+    },
+    Error {
+        message: String,
+    },
     Pong,
 }
 
@@ -57,7 +69,12 @@ pub struct WsQuery {
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(query): Query<WsQuery>,
-    State((sessions, _, observal, free_keys)): State<(Arc<SessionManager>, Option<String>, Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>, Arc<crate::free_keys::FreeKeyPool>)>,
+    State((sessions, _, observal, free_keys)): State<(
+        Arc<SessionManager>,
+        Option<String>,
+        Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>,
+        Arc<crate::free_keys::FreeKeyPool>,
+    )>,
 ) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_socket(socket, query.session_id, sessions, observal, free_keys))
 }
@@ -76,7 +93,15 @@ async fn handle_socket(
             Some(s) => (s.0, s.1, None, None),
             None => return,
         },
-        None => match resolve_new_session(&sessions, &mut ws_sender, &mut ws_receiver, &observal, &free_keys).await {
+        None => match resolve_new_session(
+            &sessions,
+            &mut ws_sender,
+            &mut ws_receiver,
+            &observal,
+            &free_keys,
+        )
+        .await
+        {
             Some(s) => (s.0, s.1, s.2, s.3),
             None => return,
         },
@@ -87,7 +112,9 @@ async fn handle_socket(
     // Send connected/reconnected confirmation
     let confirm_msg = if is_reconnect {
         info!(session_id = %session_id, "Client reconnected");
-        ServerMessage::Reconnected { session_id: session_id.clone() }
+        ServerMessage::Reconnected {
+            session_id: session_id.clone(),
+        }
     } else {
         info!(session_id = %session_id, "Session created");
         ServerMessage::Connected {
@@ -98,7 +125,9 @@ async fn handle_socket(
     };
 
     if ws_sender
-        .send(Message::Text(serde_json::to_string(&confirm_msg).unwrap().into()))
+        .send(Message::Text(
+            serde_json::to_string(&confirm_msg).unwrap().into(),
+        ))
         .await
         .is_err()
     {
@@ -161,24 +190,19 @@ async fn resolve_new_session(
 
     send_state(ws_sender, "provisioning", "creating container").await;
 
-    // If no provider API key was sent, assign a free-tier key
-    let has_user_key = config.env_vars.keys().any(|k| {
-        k.ends_with("_API_KEY") || k.ends_with("_ACCESS_KEY_ID") || k == "AWS_BEARER_TOKEN_BEDROCK"
-    });
-
-    if !has_user_key {
-        if let Some(provider_key) = free_keys.next_key() {
-            info!(provider = provider_key.provider, "Assigning free-tier key");
-            config.env_vars.insert(provider_key.env_var.to_string(), provider_key.key.clone());
-            config.env_vars.insert("CAPSULE_AGENT".to_string(), "opencode".to_string());
-            config.env_vars.insert("CAPSULE_FREE_TIER".to_string(), "1".to_string());
-        }
+    if let Err(message) = configure_claude_env(&mut config, free_keys) {
+        warn!(error = message, "Claude Code session rejected");
+        send_error(ws_sender, message).await;
+        return None;
     }
 
     // Provision Observal user — non-blocking, skip if unavailable
     let session_id_preview = Uuid::new_v4().to_string();
     let mut observal_access_token: Option<String> = None;
     let mut observal_refresh_token: Option<String> = None;
+
+    send_state(ws_sender, "provisioning", "configuring Observal traces").await;
+    wait_for_observal(observal, tokio::time::Duration::from_secs(10)).await;
 
     let observal_guard = observal.read().await;
     if let Some(client) = observal_guard.as_ref() {
@@ -210,6 +234,8 @@ async fn resolve_new_session(
     }
     drop(observal_guard);
 
+    send_state(ws_sender, "provisioning", "starting Claude terminal").await;
+
     match sessions.create_session(cols, rows, config).await {
         Ok(s) => Some((s, false, observal_access_token, observal_refresh_token)),
         Err(e) => {
@@ -217,6 +243,165 @@ async fn resolve_new_session(
             send_error(ws_sender, &e.to_string()).await;
             None
         }
+    }
+}
+
+fn configure_claude_env(
+    config: &mut ContainerConfig,
+    free_keys: &crate::free_keys::FreeKeyPool,
+) -> Result<(), &'static str> {
+    config
+        .env_vars
+        .insert("CAPSULE_AGENT".to_string(), "claude".to_string());
+
+    if has_claude_credentials(&config.env_vars) {
+        return Ok(());
+    }
+
+    if let Some(key) = configured_anthropic_key() {
+        config.env_vars.insert("ANTHROPIC_API_KEY".to_string(), key);
+        return Ok(());
+    }
+
+    if let Some(provider_key) = free_keys.next_key() {
+        match provider_key.provider {
+            "anthropic" => {
+                config
+                    .env_vars
+                    .insert("ANTHROPIC_API_KEY".to_string(), provider_key.key.clone());
+                return Ok(());
+            }
+            "openrouter" => {
+                configure_openrouter_claude_env(config, &provider_key.key);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    Err(
+        "Claude Code is not configured. Set CAPSULE_FREE_KEYS_OPENROUTER, OPENROUTER_API_KEY, ANTHROPIC_API_KEY, or CAPSULE_ANTHROPIC_API_KEY in .env, then restart the runtime.",
+    )
+}
+
+fn configure_openrouter_claude_env(config: &mut ContainerConfig, key: &str) {
+    config
+        .env_vars
+        .insert("OPENROUTER_API_KEY".to_string(), key.to_string());
+    config.env_vars.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        std::env::var("CAPSULE_OPENROUTER_ANTHROPIC_BASE_URL")
+            .unwrap_or_else(|_| "https://openrouter.ai/api".to_string()),
+    );
+    config
+        .env_vars
+        .insert("ANTHROPIC_API_KEY".to_string(), String::new());
+    config
+        .env_vars
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), key.to_string());
+
+    let opus_model = std::env::var("CAPSULE_OPENROUTER_OPUS_MODEL")
+        .or_else(|_| std::env::var("CAPSULE_CLAUDE_CODE_MODEL"))
+        .or_else(|_| std::env::var("CAPSULE_OPENROUTER_MODEL"))
+        .unwrap_or_else(|_| "~anthropic/claude-opus-latest".to_string());
+    let sonnet_model = std::env::var("CAPSULE_OPENROUTER_SONNET_MODEL")
+        .or_else(|_| std::env::var("CAPSULE_CLAUDE_CODE_MODEL"))
+        .or_else(|_| std::env::var("CAPSULE_OPENROUTER_MODEL"))
+        .unwrap_or_else(|_| "~anthropic/claude-sonnet-latest".to_string());
+    let haiku_model = std::env::var("CAPSULE_OPENROUTER_HAIKU_MODEL")
+        .or_else(|_| std::env::var("CAPSULE_CLAUDE_CODE_SMALL_MODEL"))
+        .or_else(|_| std::env::var("CAPSULE_OPENROUTER_SMALL_MODEL"))
+        .unwrap_or_else(|_| "~anthropic/claude-haiku-latest".to_string());
+
+    config
+        .env_vars
+        .insert("ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(), opus_model);
+    config
+        .env_vars
+        .insert("ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(), sonnet_model);
+    config.env_vars.insert(
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
+        haiku_model.clone(),
+    );
+    config
+        .env_vars
+        .insert("CLAUDE_CODE_SUBAGENT_MODEL".to_string(), haiku_model);
+}
+
+fn has_claude_credentials(env_vars: &HashMap<String, String>) -> bool {
+    if env_vars
+        .get("ANTHROPIC_API_KEY")
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return true;
+    }
+
+    if env_vars
+        .get("ANTHROPIC_AUTH_TOKEN")
+        .is_some_and(|value| !value.trim().is_empty())
+        && env_vars
+            .get("ANTHROPIC_BASE_URL")
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return true;
+    }
+
+    let bedrock_enabled = env_vars
+        .get("CLAUDE_CODE_USE_BEDROCK")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    if !bedrock_enabled {
+        return false;
+    }
+
+    env_vars
+        .get("AWS_BEARER_TOKEN_BEDROCK")
+        .is_some_and(|value| !value.trim().is_empty())
+        || (env_vars
+            .get("AWS_ACCESS_KEY_ID")
+            .is_some_and(|value| !value.trim().is_empty())
+            && env_vars
+                .get("AWS_SECRET_ACCESS_KEY")
+                .is_some_and(|value| !value.trim().is_empty()))
+}
+
+fn configured_anthropic_key() -> Option<String> {
+    for name in ["ANTHROPIC_API_KEY", "CAPSULE_ANTHROPIC_API_KEY"] {
+        if let Ok(value) = std::env::var(name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    let value = std::env::var("CAPSULE_ANTHROPIC_API_KEYS")
+        .or_else(|_| std::env::var("CAPSULE_FREE_KEYS_ANTHROPIC"))
+        .ok()?;
+    value
+        .split(',')
+        .map(str::trim)
+        .find(|key| !key.is_empty())
+        .map(ToString::to_string)
+}
+
+async fn wait_for_observal(
+    observal: &Arc<tokio::sync::RwLock<Option<crate::observal::ObservalClient>>>,
+    timeout: tokio::time::Duration,
+) {
+    if std::env::var("OBSERVAL_API_URL")
+        .ok()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return;
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    while tokio::time::Instant::now() < deadline {
+        if observal.read().await.is_some() {
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     }
 }
 
@@ -244,7 +429,6 @@ async fn send_state(
         .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
         .await;
 }
-
 
 /// Wait for resize (required) and optional session_config messages.
 /// Returns (cols, rows, ContainerConfig). Times out to defaults after 5s.
@@ -343,7 +527,12 @@ async fn wait_for_init_messages(
         }
     }
 
-    info!(got_resize, got_config, env_count = config.env_vars.len(), "Init messages received");
+    info!(
+        got_resize,
+        got_config,
+        env_count = config.env_vars.len(),
+        "Init messages received"
+    );
     Some((cols, rows, config))
 }
 
@@ -400,7 +589,7 @@ async fn run_session(
 async fn handle_ws_message(msg: Message, session: &Arc<RwLock<Session>>) -> bool {
     // Update activity timestamp
     session.write().await.touch();
-    
+
     match msg {
         Message::Text(text) => {
             let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) else {
@@ -408,9 +597,7 @@ async fn handle_ws_message(msg: Message, session: &Arc<RwLock<Session>>) -> bool
             };
             handle_client_message(client_msg, session).await
         }
-        Message::Binary(data) => {
-            session.read().await.write(&data).await.is_ok()
-        }
+        Message::Binary(data) => session.read().await.write(&data).await.is_ok(),
         Message::Close(_) => false,
         _ => true,
     }

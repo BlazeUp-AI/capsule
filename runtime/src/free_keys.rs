@@ -1,7 +1,7 @@
-//! Free-tier API key pool with round-robin rotation and fallback priority.
+//! Optional provider API key pool for Claude Code routing and Observal insights.
 //!
-//! Priority: Gemini → Groq → OpenRouter
-//! Keys are configured via comma-separated env vars.
+//! Claude Code can use Anthropic keys directly. OpenRouter keys are used by
+//! pointing Claude Code at OpenRouter's Anthropic-compatible endpoint.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::info;
@@ -22,42 +22,19 @@ impl FreeKeyPool {
     pub fn from_env() -> Self {
         let mut keys = Vec::new();
 
-        if let Ok(val) = std::env::var("CAPSULE_FREE_KEYS_GEMINI") {
-            for k in val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                keys.push(ProviderKey {
-                    provider: "gemini",
-                    env_var: "GOOGLE_API_KEY",
-                    key: k.to_string(),
-                });
-            }
-        }
-
-        if let Ok(val) = std::env::var("CAPSULE_FREE_KEYS_GROQ") {
-            for k in val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                keys.push(ProviderKey {
-                    provider: "groq",
-                    env_var: "GROQ_API_KEY",
-                    key: k.to_string(),
-                });
-            }
-        }
-
-        if let Ok(val) = std::env::var("CAPSULE_FREE_KEYS_OPENROUTER") {
-            for k in val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                keys.push(ProviderKey {
-                    provider: "openrouter",
-                    env_var: "OPENROUTER_API_KEY",
-                    key: k.to_string(),
-                });
-            }
-        }
+        push_anthropic_keys(&mut keys, "ANTHROPIC_API_KEY");
+        push_anthropic_keys(&mut keys, "CAPSULE_ANTHROPIC_API_KEY");
+        push_anthropic_keys(&mut keys, "CAPSULE_ANTHROPIC_API_KEYS");
+        push_anthropic_keys(&mut keys, "CAPSULE_FREE_KEYS_ANTHROPIC");
+        push_openrouter_keys(&mut keys, "CAPSULE_FREE_KEYS_OPENROUTER");
+        push_openrouter_keys(&mut keys, "OPENROUTER_API_KEY");
+        push_openrouter_keys(&mut keys, "CAPSULE_OPENROUTER_API_KEYS");
 
         info!(
             total_keys = keys.len(),
-            gemini = keys.iter().filter(|k| k.provider == "gemini").count(),
-            groq = keys.iter().filter(|k| k.provider == "groq").count(),
+            anthropic = keys.iter().filter(|k| k.provider == "anthropic").count(),
             openrouter = keys.iter().filter(|k| k.provider == "openrouter").count(),
-            "Free key pool initialized"
+            "Provider key pool initialized"
         );
 
         Self {
@@ -77,5 +54,37 @@ impl FreeKeyPool {
         }
         let idx = self.index.fetch_add(1, Ordering::Relaxed) % self.keys.len();
         Some(&self.keys[idx])
+    }
+}
+
+fn push_openrouter_keys(keys: &mut Vec<ProviderKey>, env_name: &str) {
+    if let Ok(value) = std::env::var(env_name) {
+        for key in value
+            .split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            keys.push(ProviderKey {
+                provider: "openrouter",
+                env_var: "OPENROUTER_API_KEY",
+                key: key.to_string(),
+            });
+        }
+    }
+}
+
+fn push_anthropic_keys(keys: &mut Vec<ProviderKey>, env_name: &str) {
+    if let Ok(value) = std::env::var(env_name) {
+        for key in value
+            .split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            keys.push(ProviderKey {
+                provider: "anthropic",
+                env_var: "ANTHROPIC_API_KEY",
+                key: key.to_string(),
+            });
+        }
     }
 }

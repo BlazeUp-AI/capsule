@@ -140,6 +140,18 @@
     }
   }
 
+  function selectTab(path) {
+    activeTabPath = path;
+    switchModel(path);
+  }
+
+  function handleTabKeydown(event, path) {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+
+    event.preventDefault();
+    selectTab(path);
+  }
+
   // ── Monaco ────────────────────────────────────────────────────────────────
 
   async function ensureEditor() {
@@ -301,17 +313,27 @@
   <div class="main">
     {#if openTabs.length > 0}
       <!-- Tab bar -->
-      <div class="tab-bar">
+      <div class="tab-bar" role="tablist" aria-label="Open files">
         {#each openTabs as tab}
-          <button
+          <div
+            role="tab"
+            tabindex="0"
             class="tab"
             class:active={tab.path === activeTabPath}
-            onclick={() => { activeTabPath = tab.path; switchModel(tab.path); }}
+            aria-selected={tab.path === activeTabPath}
+            onclick={() => selectTab(tab.path)}
+            onkeydown={(e) => handleTabKeydown(e, tab.path)}
           >
             <span class="tab-name">{tab.name}</span>
             {#if tab.modified}<span class="tab-dot"></span>{/if}
-            <button class="tab-close" onclick={(e) => { e.stopPropagation(); closeTab(tab.path); }}>×</button>
-          </button>
+            <button
+              type="button"
+              class="tab-close"
+              aria-label="Close {tab.name}"
+              onclick={(e) => { e.stopPropagation(); closeTab(tab.path); }}
+              onkeydown={(e) => e.stopPropagation()}
+            >×</button>
+          </div>
         {/each}
       </div>
       <!-- Monaco -->
