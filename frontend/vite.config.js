@@ -10,23 +10,23 @@ export default defineConfig({
     port: 3002,
     proxy: {
       '/ws': {
-        target: 'http://localhost:3005',
+        target: 'http://localhost:3001',
         ws: true,
       },
       '/api': {
-        target: 'http://localhost:3005',
+        target: 'http://localhost:3001',
       },
       '/observal': {
-        target: 'http://localhost:3005',
+        target: 'http://localhost:3001',
       },
       '/assets': {
-        target: 'http://localhost:3005',
+        target: 'http://localhost:3001',
       },
       '/fonts': {
-        target: 'http://localhost:3005',
+        target: 'http://localhost:3001',
       },
       '/observal-logo.svg': {
-        target: 'http://localhost:3005',
+        target: 'http://localhost:3001',
       },
     },
   },
